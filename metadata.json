@@ -1,0 +1,6 @@
+{
+  "name": "Melodex - Modern MIDI Player & Workstation",
+  "description": "Sophisticated browser-based MIDI playback, SoundFont synthesis, multitrack mixing, virtual piano visualization, and workstation environment.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
