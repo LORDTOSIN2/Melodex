@@ -103,11 +103,20 @@ export interface SymbolicArrangement {
   tracks: SymbolicTrack[];
 }
 
+export interface BarMusicalSummary {
+  bar: number;
+  chordSymbol: string;
+  bassNote: string | null;
+  melodyMotif: string;
+  density: 'sparse' | 'medium' | 'dense';
+}
+
 export interface MidiSongSummary {
   fileName: string;
   bpm: number;
   timeSignatureNumerator: number;
   timeSignatureDenominator: number;
+  estimatedKey: string;
   totalBars: number;
   totalBeats: number;
   durationSeconds: number;
@@ -118,11 +127,17 @@ export interface MidiSongSummary {
     channels: number[];
     program: number;
     noteCount: number;
+    isDrum: boolean;
+    role: 'drums' | 'bass' | 'chords' | 'melody' | 'pad' | 'multi' | 'other';
+    pitchRange: string;
   }[];
   barDigest: string[];
+  barDetails: BarMusicalSummary[];
 }
 
-export type AiComposeMode = 'create' | 'add_track';
+export type AiComposeMode = 'create' | 'add_track' | 'remix';
+
+export type RemixScope = 'full' | 'keep_selected';
 
 export interface AiComposeRequest {
   mode: AiComposeMode;
@@ -132,11 +147,15 @@ export interface AiComposeRequest {
   totalBars?: number;
   timeSignature?: string;
   songSummary?: MidiSongSummary;
+  remixStyle?: string;
+  remixScope?: RemixScope;
+  keepTrackIndices?: number[];
+  targetBpm?: number;
+  targetBars?: number;
+  preserveMelody?: boolean;
 }
 
 export interface AiComposeResponse {
   arrangement: SymbolicArrangement;
   modelUsed: string;
 }
-
-

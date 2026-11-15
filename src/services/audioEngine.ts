@@ -26,7 +26,7 @@ class AudioEngine {
   private currentMidi: BasicMIDI | null = null;
   private rawMidiBuffer: ArrayBuffer | null = null;
   private currentMidiName: string = '';
-  private previousMidiSnapshot: { buffer: ArrayBuffer; name: string } | null = null;
+  private aiUndoStack: { buffer: ArrayBuffer; name: string }[] = [];
 
   // Channel & Track State
   private channels: ChannelState[] = [];
@@ -714,23 +714,29 @@ class AudioEngine {
   }
 
   public canUndoAiEdit(): boolean {
-    return this.previousMidiSnapshot !== null;
+    return this.aiUndoStack.length > 0;
+  }
+
+  public getAiUndoCount(): number {
+    return this.aiUndoStack.length;
   }
 
   public async loadAiMidi(buffer: ArrayBuffer, fileName: string, savePreviousForUndo = true): Promise<void> {
     if (savePreviousForUndo && this.rawMidiBuffer) {
-      this.previousMidiSnapshot = {
+      this.aiUndoStack.push({
         buffer: this.rawMidiBuffer.slice(0),
         name: this.currentMidiName
-      };
+      });
+      if (this.aiUndoStack.length > 10) {
+        this.aiUndoStack.shift();
+      }
     }
     await this.loadMidi(buffer, fileName);
   }
 
   public async undoLastAiEdit(): Promise<boolean> {
-    if (!this.previousMidiSnapshot) return false;
-    const snap = this.previousMidiSnapshot;
-    this.previousMidiSnapshot = null;
+    const snap = this.aiUndoStack.pop();
+    if (!snap) return false;
     await this.loadMidi(snap.buffer, snap.name);
     return true;
   }

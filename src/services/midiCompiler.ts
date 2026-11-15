@@ -11,6 +11,7 @@ import {
   type MIDIMessageType
 } from 'spessasynth_core';
 import {
+  BarMusicalSummary,
   MidiSongSummary,
   SymbolicArrangement,
   SymbolicNote,
@@ -274,9 +275,258 @@ export function mergeTracksIntoMidi(
   };
 }
 
+const MAJOR_PROFILE = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
+const MINOR_PROFILE = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
+
+const CHORD_TEMPLATES: { suffix: string; intervals: number[] }[] = [
+  { suffix: '', intervals: [0, 4, 7] },
+  { suffix: 'm', intervals: [0, 3, 7] },
+  { suffix: '7', intervals: [0, 4, 7, 10] },
+  { suffix: 'maj7', intervals: [0, 4, 7, 11] },
+  { suffix: 'm7', intervals: [0, 3, 7, 10] },
+  { suffix: 'dim', intervals: [0, 3, 6] },
+  { suffix: 'sus4', intervals: [0, 5, 7] },
+  { suffix: '5', intervals: [0, 7] }
+];
+
+function formatMidiPitch(pitch: number): string {
+  const name = PITCH_NAMES[((pitch % 12) + 12) % 12];
+  const octave = Math.floor(pitch / 12) - 1;
+  return `${name}${octave}`;
+}
+
+function pearsonCorrelation(xs: number[], ys: number[]): number {
+  const n = xs.length;
+  const meanX = xs.reduce((a, b) => a + b, 0) / n;
+  const meanY = ys.reduce((a, b) => a + b, 0) / n;
+  let num = 0;
+  let denX = 0;
+  let denY = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = xs[i] - meanX;
+    const dy = ys[i] - meanY;
+    num += dx * dy;
+    denX += dx * dx;
+    denY += dy * dy;
+  }
+  const den = Math.sqrt(denX * denY);
+  return den === 0 ? 0 : num / den;
+}
+
+function estimateMusicalKey(pcWeights: number[]): string {
+  const total = pcWeights.reduce((a, b) => a + b, 0);
+  if (total <= 0) return 'C Major';
+
+  let bestScore = -Infinity;
+  let bestKey = 'C Major';
+
+  for (let root = 0; root < 12; root++) {
+    const rotated = Array.from({ length: 12 }, (_, i) => pcWeights[(root + i) % 12]);
+    const majScore = pearsonCorrelation(rotated, MAJOR_PROFILE);
+    if (majScore > bestScore) {
+      bestScore = majScore;
+      bestKey = `${PITCH_NAMES[root]} Major`;
+    }
+    const minScore = pearsonCorrelation(rotated, MINOR_PROFILE);
+    if (minScore > bestScore) {
+      bestScore = minScore;
+      bestKey = `${PITCH_NAMES[root]} Minor`;
+    }
+  }
+  return bestKey;
+}
+
+function detectBarChord(pcWeights: number[], lowestPitch: number | null): string {
+  const total = pcWeights.reduce((a, b) => a + b, 0);
+  if (total <= 0) return 'N.C.';
+
+  const bassPc = lowestPitch !== null ? ((lowestPitch % 12) + 12) % 12 : -1;
+  let bestScore = -Infinity;
+  let bestLabel = 'N.C.';
+
+  for (let root = 0; root < 12; root++) {
+    for (const tpl of CHORD_TEMPLATES) {
+      const intervalSet = new Set(tpl.intervals.map((iv) => (root + iv) % 12));
+      let inChord = 0;
+      let outChord = 0;
+      for (let pc = 0; pc < 12; pc++) {
+        if (intervalSet.has(pc)) {
+          inChord += pcWeights[pc];
+        } else {
+          outChord += pcWeights[pc];
+        }
+      }
+      let score = inChord - outChord * 0.6 - tpl.intervals.length * 0.04 * total;
+      if (bassPc === root) {
+        score += total * 0.28; // Favor root matching bass pitch
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        bestLabel = `${PITCH_NAMES[root]}${tpl.suffix}`;
+      }
+    }
+  }
+
+  return bestLabel;
+}
+
+function inferTrackRole(
+  isDrum: boolean,
+  melodicChannelCount: number,
+  program: number,
+  avgPitch: number,
+  noteCount: number,
+  simultaneousFraction: number
+): 'drums' | 'bass' | 'chords' | 'melody' | 'pad' | 'multi' | 'other' {
+  if (isDrum) return 'drums';
+  if (noteCount === 0) return 'other';
+  if (melodicChannelCount > 1) return 'multi';
+  if ((program >= 32 && program <= 39) || avgPitch < 48) return 'bass';
+  if (program >= 88 && program <= 103) return 'pad';
+  if (simultaneousFraction > 0.35) return 'chords';
+  if (avgPitch >= 55) return 'melody';
+  return 'other';
+}
+
+interface ParsedNoteEvent {
+  trackIndex: number;
+  channel: number;
+  pitch: number;
+  startTick: number;
+  endTick: number;
+}
+
 /**
- * Extracts a compact, token-efficient musical summary of the currently loaded MIDI
- * so AI models can harmonize, match tempo/bars, and pick unused channels cleanly.
+ * Non-destructively preserves selected original track indices and replaces remaining tracks
+ * with AI-generated SymbolicTracks (optionally updating tempo for style remixes).
+ */
+export function replaceTracksInMidi(
+  existingBuffer: ArrayBuffer,
+  existingName: string,
+  keepTrackIndices: number[],
+  newTracks: SymbolicTrack[],
+  targetBpm?: number
+): {
+  buffer: ArrayBuffer;
+  fileName: string;
+  keptTrackCount: number;
+  mergedTracks: SymbolicTrack[];
+} {
+  const sourceMidi = BasicMIDI.fromArrayBuffer(existingBuffer.slice(0), existingName);
+  const ppq = sourceMidi.timeDivision || PPQ;
+
+  const outMidi = new BasicMIDI();
+  outMidi.format = 1;
+  outMidi.timeDivision = ppq;
+
+  // Build dedicated conductor track (Track 0)
+  const conductorTrack = new MIDITrack();
+  const baseTitle = existingName.replace(/\.(mid|midi|kar)$/i, '') || 'Remix';
+  conductorTrack.name = `${baseTitle} (AI Remix)`;
+
+  const conductorEvents: MIDIMessage[] = [
+    new MIDIMessage(0, MIDIMessageTypes.trackName, encodeAscii(conductorTrack.name))
+  ];
+
+  // Collect time signatures from source
+  let hasTimeSig = false;
+  let maxConductorTick = 0;
+  for (const t of sourceMidi.tracks) {
+    for (const ev of t.events) {
+      if (ev.statusByte === MIDIMessageTypes.timeSignature) {
+        hasTimeSig = true;
+        conductorEvents.push(new MIDIMessage(ev.ticks, ev.statusByte, ev.data.slice()));
+        if (ev.ticks > maxConductorTick) maxConductorTick = ev.ticks;
+      } else if (!targetBpm && ev.statusByte === MIDIMessageTypes.setTempo) {
+        conductorEvents.push(new MIDIMessage(ev.ticks, ev.statusByte, ev.data.slice()));
+        if (ev.ticks > maxConductorTick) maxConductorTick = ev.ticks;
+      }
+    }
+  }
+
+  if (!hasTimeSig) {
+    conductorEvents.push(
+      new MIDIMessage(0, MIDIMessageTypes.timeSignature, buildTimeSignatureData(4, 4))
+    );
+  }
+
+  if (targetBpm && Number.isFinite(targetBpm) && targetBpm > 0) {
+    conductorEvents.push(
+      new MIDIMessage(0, MIDIMessageTypes.setTempo, buildSetTempoData(targetBpm))
+    );
+  } else {
+    const hasTempo = conductorEvents.some((e) => e.statusByte === MIDIMessageTypes.setTempo);
+    if (!hasTempo) {
+      conductorEvents.push(
+        new MIDIMessage(0, MIDIMessageTypes.setTempo, buildSetTempoData(120))
+      );
+    }
+  }
+
+  conductorEvents.sort((a, b) => a.ticks - b.ticks);
+  conductorEvents.push(
+    new MIDIMessage(maxConductorTick + 10, MIDIMessageTypes.endOfTrack, new Uint8Array([]))
+  );
+  conductorTrack.pushEvents(...conductorEvents);
+  outMidi.tracks.push(conductorTrack);
+
+  // Copy kept tracks intact (excluding tempo/timeSignature meta events so Track 0 owns timing)
+  const keepSet = new Set(keepTrackIndices);
+  const keptMelodicChannels = new Set<number>();
+  let keptTrackCount = 0;
+
+  sourceMidi.tracks.forEach((srcTrack, idx) => {
+    if (!keepSet.has(idx)) return;
+    const cloned = new MIDITrack();
+    cloned.name = srcTrack.name || `Kept Track ${idx + 1}`;
+    cloned.port = srcTrack.port || 0;
+
+    const filteredEvents = srcTrack.events
+      .filter(
+        (ev) =>
+          ev.statusByte !== MIDIMessageTypes.setTempo &&
+          ev.statusByte !== MIDIMessageTypes.timeSignature
+      )
+      .map((ev) => new MIDIMessage(ev.ticks, ev.statusByte, ev.data.slice()));
+
+    if (filteredEvents.length === 0) return;
+
+    const hasEnd = filteredEvents.some((e) => e.statusByte === MIDIMessageTypes.endOfTrack);
+    if (!hasEnd) {
+      const lastTick = filteredEvents[filteredEvents.length - 1]?.ticks ?? 0;
+      filteredEvents.push(
+        new MIDIMessage(lastTick + 10, MIDIMessageTypes.endOfTrack, new Uint8Array([]))
+      );
+    }
+
+    cloned.pushEvents(...filteredEvents);
+    outMidi.tracks.push(cloned);
+    keptTrackCount++;
+
+    srcTrack.channels.forEach((ch) => {
+      if (ch !== 9) keptMelodicChannels.add(ch);
+    });
+  });
+
+  // Append newly composed AI backing tracks on non-colliding channels
+  const sanitizedNewTracks = sanitizeTracks(newTracks, keptMelodicChannels);
+  for (const track of sanitizedNewTracks) {
+    outMidi.tracks.push(buildMidiTrackFromSymbolic(track, ppq));
+  }
+
+  outMidi.flush();
+  return {
+    buffer: outMidi.writeMIDI(),
+    fileName: `${baseTitle}_remix.mid`,
+    keptTrackCount,
+    mergedTracks: sanitizedNewTracks
+  };
+}
+
+/**
+ * Extracts a rich yet token-efficient musical summary of the currently loaded MIDI
+ * (Key estimation, track roles, per-bar chords, bass root, and lead melody motifs)
+ * so AI models can compose stems or remix arrangements accurately.
  */
 export function summarizeMidiForAi(buffer: ArrayBuffer, fileName: string): MidiSongSummary {
   const midi = BasicMIDI.fromArrayBuffer(buffer.slice(0), fileName);
@@ -289,12 +539,12 @@ export function summarizeMidiForAi(buffer: ArrayBuffer, fileName: string): MidiS
   // Detect first time signature meta event if present
   let tsNum = 4;
   let tsDen = 4;
-  for (const t of midi.tracks) {
+  outer: for (const t of midi.tracks) {
     for (const ev of t.events) {
       if (ev.statusByte === MIDIMessageTypes.timeSignature && ev.data.length >= 2) {
         tsNum = ev.data[0] || 4;
         tsDen = Math.pow(2, ev.data[1] ?? 2);
-        break;
+        break outer;
       }
     }
   }
@@ -307,62 +557,189 @@ export function summarizeMidiForAi(buffer: ArrayBuffer, fileName: string): MidiS
   const totalBeats = Math.round(totalBars * beatsPerBar);
 
   const usedChannelSet = new Set<number>();
+  const globalPcWeights = new Array<number>(12).fill(0);
+  const allMelodicNotes: ParsedNoteEvent[] = [];
+
   const existingTracks = midi.tracks.map((track, idx) => {
     let program = 0;
     let noteCount = 0;
+    let minPitch = 127;
+    let maxPitch = 0;
+    let pitchSum = 0;
+    let simultaneousCount = 0;
+    let prevStartTick = -1;
+
+    const activeStarts = new Map<string, number>();
+
     for (const ev of track.events) {
       const status = ev.statusByte & 0xf0;
+      const ch = ev.statusByte & 0x0f;
       if (status === MIDIMessageTypes.programChange) {
         program = ev.data[0] ?? 0;
       } else if (status === MIDIMessageTypes.noteOn && (ev.data[1] ?? 0) > 0) {
+        const pitch = ev.data[0] ?? 60;
         noteCount++;
+        pitchSum += pitch;
+        if (pitch < minPitch) minPitch = pitch;
+        if (pitch > maxPitch) maxPitch = pitch;
+        if (prevStartTick !== -1 && Math.abs(ev.ticks - prevStartTick) <= Math.round(ppq * 0.08)) {
+          simultaneousCount++;
+        }
+        prevStartTick = ev.ticks;
+        if (ch !== 9) {
+          activeStarts.set(`${ch}:${pitch}`, ev.ticks);
+        }
+      } else if (
+        status === MIDIMessageTypes.noteOff ||
+        (status === MIDIMessageTypes.noteOn && (ev.data[1] ?? 0) === 0)
+      ) {
+        const pitch = ev.data[0] ?? 60;
+        const key = `${ch}:${pitch}`;
+        const startTick = activeStarts.get(key);
+        if (startTick !== undefined && ch !== 9) {
+          const endTick = Math.max(startTick + Math.round(ppq * 0.125), ev.ticks);
+          const durBeats = Math.min(8, (endTick - startTick) / ppq);
+          globalPcWeights[pitch % 12] += durBeats;
+          allMelodicNotes.push({ trackIndex: idx, channel: ch, pitch, startTick, endTick });
+          activeStarts.delete(key);
+        }
       }
     }
+
+    // Flush any dangling notes at track end
+    for (const [key, startTick] of activeStarts.entries()) {
+      const [chStr, pitchStr] = key.split(':');
+      const ch = Number(chStr);
+      const pitch = Number(pitchStr);
+      const endTick = startTick + ppq;
+      globalPcWeights[pitch % 12] += 1;
+      allMelodicNotes.push({ trackIndex: idx, channel: ch, pitch, startTick, endTick });
+    }
+
     const channels = Array.from(track.channels);
     channels.forEach((c) => usedChannelSet.add(c));
+    const melodicChannelCount = channels.filter((c) => c !== 9).length;
+    const isDrum = channels.includes(9) && channels.length === 1;
+    const avgPitch = noteCount > 0 ? pitchSum / noteCount : 60;
+    const simultaneousFraction = noteCount > 1 ? simultaneousCount / noteCount : 0;
+    const role = inferTrackRole(
+      isDrum,
+      melodicChannelCount,
+      program,
+      avgPitch,
+      noteCount,
+      simultaneousFraction
+    );
+    const pitchRange = noteCount > 0 ? `${formatMidiPitch(minPitch)}-${formatMidiPitch(maxPitch)}` : '-';
+
     return {
       index: idx,
       name: track.name.trim() || `Track ${idx + 1}`,
       channels,
       program,
-      noteCount
+      noteCount,
+      isDrum,
+      role,
+      pitchRange
     };
   });
 
-  // Build compact pitch-class digest for up to the first 32 bars (keeps AI prompt light & accurate)
-  const maxBarsToDigest = Math.min(totalBars, 32);
-  const barPitchSets: Set<string>[] = Array.from({ length: maxBarsToDigest }, () => new Set<string>());
+  const estimatedKey = estimateMusicalKey(globalPcWeights);
 
-  for (const track of midi.tracks) {
-    for (const ev of track.events) {
-      const status = ev.statusByte & 0xf0;
-      const ch = ev.statusByte & 0x0f;
-      if (status === MIDIMessageTypes.noteOn && (ev.data[1] ?? 0) > 0 && ch !== 9) {
-        const barIdx = Math.floor(ev.ticks / ticksPerBar);
-        if (barIdx >= 0 && barIdx < maxBarsToDigest) {
-          const pitchName = PITCH_NAMES[(ev.data[0] ?? 60) % 12];
-          barPitchSets[barIdx].add(pitchName);
-        }
+  // Build detailed per-bar harmony & melody analysis for up to 24 bars
+  const maxBarsToDigest = Math.min(totalBars, 24);
+  const barPcWeights: number[][] = Array.from({ length: maxBarsToDigest }, () =>
+    new Array<number>(12).fill(0)
+  );
+  const barLowestPitch: (number | null)[] = Array.from({ length: maxBarsToDigest }, () => null);
+  const barNotes: ParsedNoteEvent[][] = Array.from({ length: maxBarsToDigest }, () => []);
+
+  for (const n of allMelodicNotes) {
+    const barIdx = Math.floor(n.startTick / ticksPerBar);
+    if (barIdx >= 0 && barIdx < maxBarsToDigest) {
+      const durBeats = Math.max(0.25, Math.min(beatsPerBar, (n.endTick - n.startTick) / ppq));
+      barPcWeights[barIdx][n.pitch % 12] += durBeats;
+      const curLow = barLowestPitch[barIdx];
+      if (curLow === null || n.pitch < curLow) {
+        barLowestPitch[barIdx] = n.pitch;
       }
+      barNotes[barIdx].push(n);
     }
   }
 
-  const barDigest = barPitchSets.map((set, i) => {
-    const pitches = Array.from(set).slice(0, 6);
-    return `Bar ${i + 1}: ${pitches.length > 0 ? pitches.join(',') : 'Rest'}`;
+  // Pick melody track if one clearly exists to keep motif extraction super clean
+  const melodyTracks = new Set(
+    existingTracks.filter((t) => t.role === 'melody').map((t) => t.index)
+  );
+
+  const barDetails: BarMusicalSummary[] = Array.from({ length: maxBarsToDigest }, (_, barIdx) => {
+    const chordSymbol = detectBarChord(barPcWeights[barIdx], barLowestPitch[barIdx]);
+    const bassNote = barLowestPitch[barIdx] !== null ? formatMidiPitch(barLowestPitch[barIdx]!) : null;
+    const notesInBar = barNotes[barIdx];
+
+    // Prefer dedicated melody track notes if present; otherwise prefer upper-register pitches (>= G3 / 55)
+    let candidateNotes =
+      melodyTracks.size > 0 && notesInBar.some((n) => melodyTracks.has(n.trackIndex))
+        ? notesInBar.filter((n) => melodyTracks.has(n.trackIndex))
+        : notesInBar;
+    const upperNotes = candidateNotes.filter((n) => n.pitch >= 55);
+    if (upperNotes.length > 0) {
+      candidateNotes = upperNotes;
+    }
+
+    // Group by quantized 16th-beat onset within bar & keep top pitch per onset (up to 6 motif notes)
+    const barStartTick = barIdx * ticksPerBar;
+    const stepTicks = Math.max(1, Math.round(ppq / 4));
+    const onsetTop = new Map<number, ParsedNoteEvent>();
+    for (const n of candidateNotes) {
+      const relTick = Math.max(0, n.startTick - barStartTick);
+      const qStep = Math.round(relTick / stepTicks);
+      const existing = onsetTop.get(qStep);
+      if (!existing || n.pitch > existing.pitch) {
+        onsetTop.set(qStep, n);
+      }
+    }
+
+    const motifTokens = Array.from(onsetTop.entries())
+      .sort((a, b) => a[0] - b[0])
+      .slice(0, 6)
+      .map(([qStep, n]) => {
+        const beatInBar = Number((qStep * 0.25).toFixed(2));
+        const durBeats = Number(
+          Math.max(0.25, Math.min(beatsPerBar, (n.endTick - n.startTick) / ppq)).toFixed(2)
+        );
+        return `${formatMidiPitch(n.pitch)}@${beatInBar}(${durBeats})`;
+      });
+
+    const density: 'sparse' | 'medium' | 'dense' =
+      notesInBar.length <= 4 ? 'sparse' : notesInBar.length <= 14 ? 'medium' : 'dense';
+
+    return {
+      bar: barIdx + 1,
+      chordSymbol,
+      bassNote,
+      melodyMotif: motifTokens.length > 0 ? motifTokens.join(' ') : 'Rest',
+      density
+    };
   });
+
+  const barDigest = barDetails.map(
+    (b) => `Bar ${b.bar}: ${b.chordSymbol}${b.bassNote ? ` (bass ${b.bassNote})` : ''}`
+  );
 
   return {
     fileName,
     bpm,
     timeSignatureNumerator: tsNum,
     timeSignatureDenominator: tsDen,
+    estimatedKey,
     totalBars,
     totalBeats,
     durationSeconds: Number((midi.duration || 0).toFixed(2)),
     usedChannels: Array.from(usedChannelSet).sort((a, b) => a - b),
     existingTracks: existingTracks.filter((t) => t.noteCount > 0 || t.channels.length > 0),
-    barDigest
+    barDigest,
+    barDetails
   };
 }
 

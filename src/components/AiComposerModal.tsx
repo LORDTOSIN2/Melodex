@@ -8,23 +8,29 @@ import {
   Wand2,
   X,
   Plus,
-  Music,
   Download,
   RotateCcw,
   Loader2,
   Sparkles,
   Layers,
   AlertCircle,
-  CheckCircle2
+  CheckCircle2,
+  RefreshCw,
+  Check
 } from 'lucide-react';
 import { audioEngine } from '../services/audioEngine';
-import { compileArrangementToMidi, mergeTracksIntoMidi } from '../services/midiCompiler';
+import {
+  compileArrangementToMidi,
+  mergeTracksIntoMidi,
+  replaceTracksInMidi
+} from '../services/midiCompiler';
 import { GM_INSTRUMENTS } from '../services/gmInstruments';
 import type {
   AiComposeMode,
   AiComposeRequest,
   AiComposeResponse,
   MidiSongSummary,
+  RemixScope,
   SymbolicArrangement
 } from '../types/midi';
 
@@ -38,7 +44,8 @@ interface AiComposerModalProps {
 const CREATE_PRESETS = [
   {
     label: 'Funk Groove (112 BPM)',
-    prompt: 'Upbeat 1970s funk groove with tight kick/snare/hi-hat drums, syncopated slap bassline, Rhodes electric piano chords, and punchy brass stabs.',
+    prompt:
+      'Upbeat 1970s funk groove with tight kick/snare/hi-hat drums, syncopated slap bassline, Rhodes electric piano chords, and punchy brass stabs.',
     bpm: 112,
     key: 'E Minor',
     bars: 8,
@@ -46,7 +53,8 @@ const CREATE_PRESETS = [
   },
   {
     label: 'Lo-Fi Chill (82 BPM)',
-    prompt: 'Warm lo-fi chillhop beat with dusty swung drums, jazzy Rhodes 7th chords, deep finger bass, and a gentle flute melody.',
+    prompt:
+      'Warm lo-fi chillhop beat with dusty swung drums, jazzy Rhodes 7th chords, deep finger bass, and a gentle flute melody.',
     bpm: 82,
     key: 'F Major',
     bars: 8,
@@ -54,7 +62,8 @@ const CREATE_PRESETS = [
   },
   {
     label: '80s Synthwave (118 BPM)',
-    prompt: 'Driving 1980s retro synthwave track with punchy drums, pulsing 8th-note synth bass, lush warm pad chords, and an expressive sawtooth lead melody.',
+    prompt:
+      'Driving 1980s retro synthwave track with punchy drums, pulsing 8th-note synth bass, lush warm pad chords, and an expressive sawtooth lead melody.',
     bpm: 118,
     key: 'A Minor',
     bars: 8,
@@ -62,7 +71,8 @@ const CREATE_PRESETS = [
   },
   {
     label: 'Jazz Waltz (3/4)',
-    prompt: 'Lyrical jazz waltz in 3/4 time with acoustic upright bass, jazz brush/ride drum pattern, grand piano comping, and alto saxophone melody.',
+    prompt:
+      'Lyrical jazz waltz in 3/4 time with acoustic upright bass, jazz brush/ride drum pattern, grand piano comping, and alto saxophone melody.',
     bpm: 132,
     key: 'Bb Major',
     bars: 12,
@@ -73,19 +83,68 @@ const CREATE_PRESETS = [
 const STEM_PRESETS = [
   {
     label: 'Add Drum Groove',
-    prompt: 'Add a tight, dynamic drum kit track on channel 9 (kick, snare, hi-hat, crash accents) that locks onto the current tempo and bar structure.'
+    prompt:
+      'Add a tight, dynamic drum kit track on channel 9 (kick, snare, hi-hat, crash accents) that locks onto the current tempo and bar structure.'
   },
   {
     label: 'Add Bassline',
-    prompt: 'Add an expressive electric finger bass track that follows the root and fifth harmony of each bar with rhythmic groove.'
+    prompt:
+      'Add an expressive electric finger bass track that follows the detected chord roots and fifths of each bar with rhythmic groove.'
   },
   {
     label: 'Add String Pad',
-    prompt: 'Add a lush String Ensemble pad track playing smooth voice-led harmonic chords across each bar.'
+    prompt:
+      'Add a lush String Ensemble pad track playing smooth voice-led harmonic chords following the detected bar chords.'
   },
   {
     label: 'Add Lead Melody',
-    prompt: 'Add a memorable, lyrical solo counter-melody (Alto Sax or Acoustic Piano) that complements the existing harmony with natural phrasing.'
+    prompt:
+      'Add a memorable, lyrical solo counter-melody (Alto Sax or Acoustic Piano) that complements the existing harmony with natural phrasing.'
+  }
+];
+
+const REMIX_PRESETS = [
+  {
+    label: 'Lo-Fi Chillhop',
+    style: 'Lo-Fi Chillhop',
+    bpm: 84,
+    prompt:
+      'Reimagine this piece as a warm Lo-Fi Chillhop remix with swung dusty drums, mellow Rhodes electric piano 7th voicings, and deep round finger bass.'
+  },
+  {
+    label: '80s Synthwave',
+    style: '80s Synthwave',
+    bpm: 118,
+    prompt:
+      'Transform the arrangement into a driving 80s retro Synthwave remix with gated-feel punchy drums, driving 8th-note synth bass, warm analog pads, and bright saw lead.'
+  },
+  {
+    label: 'House / Club',
+    style: 'Deep House',
+    bpm: 124,
+    prompt:
+      'Remix into a groovy Deep House track with a 4-on-the-floor kick, crisp off-beat hi-hats, bouncy synth bassline, and rhythmic organ/piano stabs.'
+  },
+  {
+    label: 'Bossa Nova Jazz',
+    style: 'Bossa Nova Jazz',
+    bpm: 126,
+    prompt:
+      'Re-arrange into an authentic Bossa Nova acoustic jazz groove with nylon guitar syncopation, upright bass, light brush percussion, and lyrical piano/sax.'
+  },
+  {
+    label: 'Epic Orchestral',
+    style: 'Cinematic Orchestral',
+    bpm: 104,
+    prompt:
+      'Re-orchestrate for cinematic symphony orchestra with lush string ensemble swells, French horn/brass harmonies, timpani/percussion hits, and grand piano.'
+  },
+  {
+    label: '90s Funk Groove',
+    style: '90s Funk',
+    bpm: 110,
+    prompt:
+      'Remix into a high-energy 90s Funk arrangement with tight pocket drums, syncopated slap bass, Clavinet/Rhodes comping, and punchy brass section.'
   }
 ];
 
@@ -107,20 +166,47 @@ export const AiComposerModal: React.FC<AiComposerModalProps> = ({
   const [totalBars, setTotalBars] = useState<number>(8);
   const [timeSignature, setTimeSignature] = useState<string>('4/4');
 
+  // Stage 2 Remix state
+  const [remixStyle, setRemixStyle] = useState<string>(REMIX_PRESETS[0].style);
+  const [remixScope, setRemixScope] = useState<RemixScope>('full');
+  const [keepTrackIndices, setKeepTrackIndices] = useState<number[]>([]);
+  const [targetBpm, setTargetBpm] = useState<number>(84);
+  const [remixBars, setRemixBars] = useState<number>(8);
+  const [preserveMelody, setPreserveMelody] = useState<boolean>(true);
+
   const [songSummary, setSongSummary] = useState<MidiSongSummary | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastResult, setLastResult] = useState<{
     title: string;
     tracks: SymbolicArrangement['tracks'];
+    keptCount?: number;
     modelUsed: string;
   } | null>(null);
-  const [canUndo, setCanUndo] = useState(false);
+  const [undoCount, setUndoCount] = useState(0);
+
+  const refreshContext = () => {
+    const summary = audioEngine.getCurrentMidiSummary();
+    setSongSummary(summary);
+    setUndoCount(audioEngine.getAiUndoCount());
+    if (summary) {
+      setRemixBars(Math.min(Math.max(4, summary.totalBars), 16));
+      // Pre-select melody/lead track(s) cleanly for keep_selected mode
+      const melodyTracks = summary.existingTracks
+        .filter((t) => t.role === 'melody' && t.noteCount > 0)
+        .map((t) => t.index);
+      if (melodyTracks.length > 0) {
+        setKeepTrackIndices(melodyTracks);
+      } else {
+        const firstMelodic = summary.existingTracks.find((t) => !t.isDrum && t.noteCount > 0);
+        setKeepTrackIndices(firstMelodic ? [firstMelodic.index] : []);
+      }
+    }
+  };
 
   useEffect(() => {
     if (isOpen) {
-      setSongSummary(audioEngine.getCurrentMidiSummary());
-      setCanUndo(audioEngine.canUndoAiEdit());
+      refreshContext();
       setError(null);
     }
   }, [isOpen, currentSongTitle]);
@@ -131,22 +217,38 @@ export const AiComposerModal: React.FC<AiComposerModalProps> = ({
     setMode(nextMode);
     setError(null);
     setLastResult(null);
+    refreshContext();
     if (nextMode === 'add_track') {
-      setSongSummary(audioEngine.getCurrentMidiSummary());
       setPrompt(STEM_PRESETS[0].prompt);
+    } else if (nextMode === 'remix') {
+      setRemixStyle(REMIX_PRESETS[0].style);
+      setTargetBpm(REMIX_PRESETS[0].bpm);
+      setPrompt(REMIX_PRESETS[0].prompt);
     } else {
       setPrompt(CREATE_PRESETS[0].prompt);
     }
   };
 
+  const toggleKeepTrack = (trackIndex: number) => {
+    setKeepTrackIndices((prev) =>
+      prev.includes(trackIndex) ? prev.filter((id) => id !== trackIndex) : [...prev, trackIndex]
+    );
+  };
+
   const handleGenerate = async () => {
     if (!prompt.trim()) {
-      setError('Please describe the music or track you want the AI to generate.');
+      setError('Please describe the music, track, or remix direction for the AI.');
       return;
     }
 
-    if (mode === 'add_track' && !audioEngine.getCurrentMidiBuffer()) {
-      setError('Load or generate a MIDI file first before adding a new track.');
+    const activeSummary = songSummary || audioEngine.getCurrentMidiSummary();
+    if ((mode === 'add_track' || mode === 'remix') && (!audioEngine.getCurrentMidiBuffer() || !activeSummary)) {
+      setError('Load or generate a MIDI file first before adding tracks or remixing.');
+      return;
+    }
+
+    if (mode === 'remix' && remixScope === 'keep_selected' && keepTrackIndices.length === 0) {
+      setError('Select at least one track to keep intact, or switch to Full Arrangement Remix.');
       return;
     }
 
@@ -154,21 +256,36 @@ export const AiComposerModal: React.FC<AiComposerModalProps> = ({
     setError(null);
 
     try {
-      const payload: AiComposeRequest =
-        mode === 'create'
-          ? {
-              mode: 'create',
-              prompt: prompt.trim(),
-              bpm,
-              musicalKey,
-              totalBars,
-              timeSignature
-            }
-          : {
-              mode: 'add_track',
-              prompt: prompt.trim(),
-              songSummary: songSummary || audioEngine.getCurrentMidiSummary() || undefined
-            };
+      let payload: AiComposeRequest;
+
+      if (mode === 'create') {
+        payload = {
+          mode: 'create',
+          prompt: prompt.trim(),
+          bpm,
+          musicalKey,
+          totalBars,
+          timeSignature
+        };
+      } else if (mode === 'add_track') {
+        payload = {
+          mode: 'add_track',
+          prompt: prompt.trim(),
+          songSummary: activeSummary!
+        };
+      } else {
+        payload = {
+          mode: 'remix',
+          prompt: prompt.trim(),
+          songSummary: activeSummary!,
+          remixStyle,
+          remixScope,
+          keepTrackIndices: remixScope === 'keep_selected' ? keepTrackIndices : [],
+          targetBpm,
+          targetBars: remixBars,
+          preserveMelody
+        };
+      }
 
       const res = await fetch('/api/ai/compose', {
         method: 'POST',
@@ -193,7 +310,7 @@ export const AiComposerModal: React.FC<AiComposerModalProps> = ({
           tracks: compiled.sanitized.tracks,
           modelUsed: typed.modelUsed
         });
-      } else {
+      } else if (mode === 'add_track') {
         const existingBuf = audioEngine.getCurrentMidiBuffer();
         const existingName = audioEngine.getCurrentMidiName() || 'arrangement.mid';
         if (!existingBuf) {
@@ -202,15 +319,56 @@ export const AiComposerModal: React.FC<AiComposerModalProps> = ({
         const merged = mergeTracksIntoMidi(existingBuf, existingName, typed.arrangement.tracks);
         await audioEngine.loadAiMidi(merged.buffer, merged.fileName, true);
         audioEngine.play();
-        setSongSummary(audioEngine.getCurrentMidiSummary());
         setLastResult({
           title: `${currentSongTitle || existingName} (+${merged.mergedTracks.length} AI track${merged.mergedTracks.length > 1 ? 's' : ''})`,
           tracks: merged.mergedTracks,
           modelUsed: typed.modelUsed
         });
+      } else {
+        // Stage 2: Remix mode
+        if (remixScope === 'keep_selected' && keepTrackIndices.length > 0) {
+          const existingBuf = audioEngine.getCurrentMidiBuffer();
+          const existingName = audioEngine.getCurrentMidiName() || 'song.mid';
+          if (!existingBuf) {
+            throw new Error('No active MIDI buffer found.');
+          }
+          const remixed = replaceTracksInMidi(
+            existingBuf,
+            existingName,
+            keepTrackIndices,
+            typed.arrangement.tracks,
+            targetBpm
+          );
+          await audioEngine.loadAiMidi(remixed.buffer, remixed.fileName, true);
+          audioEngine.play();
+          const baseTitle = currentSongTitle || existingName.replace(/\.mid$/i, '');
+          const nextTitle = `${baseTitle} (${remixStyle} Remix)`;
+          onMidiUpdated(nextTitle);
+          setLastResult({
+            title: nextTitle,
+            tracks: remixed.mergedTracks,
+            keptCount: remixed.keptTrackCount,
+            modelUsed: typed.modelUsed
+          });
+        } else {
+          // Full re-arrangement remix
+          const arrangementToCompile: SymbolicArrangement = {
+            ...typed.arrangement,
+            bpm: targetBpm || typed.arrangement.bpm
+          };
+          const compiled = compileArrangementToMidi(arrangementToCompile);
+          await audioEngine.loadAiMidi(compiled.buffer, compiled.fileName, true);
+          audioEngine.play();
+          onMidiUpdated(compiled.sanitized.title);
+          setLastResult({
+            title: compiled.sanitized.title,
+            tracks: compiled.sanitized.tracks,
+            modelUsed: typed.modelUsed
+          });
+        }
       }
 
-      setCanUndo(audioEngine.canUndoAiEdit());
+      refreshContext();
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       setError(msg);
@@ -222,12 +380,62 @@ export const AiComposerModal: React.FC<AiComposerModalProps> = ({
   const handleUndo = async () => {
     const reverted = await audioEngine.undoLastAiEdit();
     if (reverted) {
-      setCanUndo(audioEngine.canUndoAiEdit());
-      setSongSummary(audioEngine.getCurrentMidiSummary());
+      refreshContext();
       setLastResult(null);
-      onMidiUpdated(audioEngine.getCurrentMidiName().replace(/\.mid$/i, ''));
+      onMidiUpdated(audioEngine.getCurrentMidiName().replace(/\.(mid|midi|kar)$/i, ''));
     }
   };
+
+  const renderSongAnalysisCard = (summary: MidiSongSummary | null) => (
+    <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 text-xs space-y-2">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-1.5 font-semibold text-slate-200">
+          <Layers className="w-3.5 h-3.5 text-indigo-400" />
+          <span>Musical Analysis</span>
+        </div>
+        {summary && (
+          <div className="flex flex-wrap items-center gap-1.5 font-mono text-[10px]">
+            <span className="px-2 py-0.5 rounded bg-violet-500/15 text-violet-300 border border-violet-500/30">
+              Key: {summary.estimatedKey}
+            </span>
+            <span className="px-2 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/30">
+              {summary.bpm} BPM • {summary.timeSignatureNumerator}/{summary.timeSignatureDenominator} • {summary.totalBars} bars
+            </span>
+          </div>
+        )}
+      </div>
+
+      {summary ? (
+        <div className="space-y-1.5">
+          <div className="text-[11px] text-slate-400">
+            <strong className="text-slate-300">{summary.fileName}</strong> — {summary.existingTracks.length} track(s) on channels [{summary.usedChannels.map((c) => c + 1).join(', ')}]
+          </div>
+          {summary.barDetails && summary.barDetails.length > 0 && (
+            <div className="flex flex-wrap gap-1 pt-0.5">
+              {summary.barDetails.slice(0, 8).map((b) => (
+                <span
+                  key={b.bar}
+                  className="px-1.5 py-0.5 rounded bg-slate-900 border border-slate-800 text-[10px] font-mono text-slate-300"
+                  title={`Motif: ${b.melodyMotif}`}
+                >
+                  <span className="text-slate-500">{b.bar}:</span> {b.chordSymbol}
+                </span>
+              ))}
+              {summary.barDetails.length > 8 && (
+                <span className="px-1.5 py-0.5 text-[10px] text-slate-500 font-mono">
+                  +{summary.barDetails.length - 8} bars analyzed
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+      ) : (
+        <p className="text-[11px] text-amber-400">
+          No MIDI loaded. Load a demo song or create a new MIDI first.
+        </p>
+      )}
+    </div>
+  );
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-sm animate-in fade-in">
@@ -239,9 +447,9 @@ export const AiComposerModal: React.FC<AiComposerModalProps> = ({
               <Wand2 className="w-4 h-4" />
             </div>
             <div>
-              <h2 className="text-base font-bold text-slate-100">AI MIDI Composer</h2>
+              <h2 className="text-base font-bold text-slate-100">AI MIDI Composer &amp; Remixer</h2>
               <p className="text-xs text-slate-400">
-                Create original multi-track MIDIs or add new stems to your active arrangement.
+                Create original multi-track MIDIs, layer new stems, or remix existing songs.
               </p>
             </div>
           </div>
@@ -253,38 +461,49 @@ export const AiComposerModal: React.FC<AiComposerModalProps> = ({
           </button>
         </div>
 
-        {/* Mode Switcher */}
-        <div className="grid grid-cols-2 gap-2 my-4 bg-slate-950 p-1 rounded-xl border border-slate-800">
+        {/* 3-Mode Switcher */}
+        <div className="grid grid-cols-3 gap-1.5 my-4 bg-slate-950 p-1 rounded-xl border border-slate-800">
           <button
             type="button"
             onClick={() => handleModeSwitch('create')}
-            className={`flex items-center justify-center gap-2 py-2 px-3 rounded-lg text-xs font-semibold transition-all ${
+            className={`flex items-center justify-center gap-1.5 py-2 px-2.5 rounded-lg text-xs font-semibold transition-all ${
               mode === 'create'
                 ? 'bg-indigo-600 text-white shadow-md'
                 : 'text-slate-400 hover:text-white'
             }`}
           >
             <Sparkles className="w-3.5 h-3.5" />
-            <span>Create New MIDI</span>
+            <span>Create New</span>
           </button>
           <button
             type="button"
             onClick={() => handleModeSwitch('add_track')}
-            className={`flex items-center justify-center gap-2 py-2 px-3 rounded-lg text-xs font-semibold transition-all ${
+            className={`flex items-center justify-center gap-1.5 py-2 px-2.5 rounded-lg text-xs font-semibold transition-all ${
               mode === 'add_track'
                 ? 'bg-indigo-600 text-white shadow-md'
                 : 'text-slate-400 hover:text-white'
             }`}
           >
             <Plus className="w-3.5 h-3.5" />
-            <span>Add Track / Stem to Current</span>
+            <span>Add Track / Stem</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => handleModeSwitch('remix')}
+            className={`flex items-center justify-center gap-1.5 py-2 px-2.5 rounded-lg text-xs font-semibold transition-all ${
+              mode === 'remix'
+                ? 'bg-violet-600 text-white shadow-md'
+                : 'text-slate-400 hover:text-white'
+            }`}
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+            <span>Remix Current</span>
           </button>
         </div>
 
         {/* Mode-specific context / controls */}
-        {mode === 'create' ? (
+        {mode === 'create' && (
           <div className="space-y-3 mb-4">
-            {/* Quick Style Presets */}
             <div>
               <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 block mb-1.5">
                 Quick Style Presets
@@ -309,7 +528,6 @@ export const AiComposerModal: React.FC<AiComposerModalProps> = ({
               </div>
             </div>
 
-            {/* Musical Parameters */}
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 bg-slate-950 p-3 rounded-xl border border-slate-800 text-xs">
               <div>
                 <label className="text-[10px] text-slate-400 uppercase font-bold block mb-1">
@@ -377,38 +595,12 @@ export const AiComposerModal: React.FC<AiComposerModalProps> = ({
               </div>
             </div>
           </div>
-        ) : (
-          <div className="space-y-3 mb-4">
-            {/* Active Song Context Card */}
-            <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 text-xs">
-              <div className="flex items-center justify-between mb-1.5">
-                <div className="flex items-center gap-1.5 font-semibold text-slate-200">
-                  <Layers className="w-3.5 h-3.5 text-indigo-400" />
-                  <span>Active Song Context</span>
-                </div>
-                {songSummary && (
-                  <span className="font-mono text-[11px] text-indigo-400">
-                    {songSummary.bpm} BPM • {songSummary.timeSignatureNumerator}/{songSummary.timeSignatureDenominator} • {songSummary.totalBars} bars
-                  </span>
-                )}
-              </div>
-              {songSummary ? (
-                <div className="text-[11px] text-slate-400 space-y-1">
-                  <div>
-                    <strong className="text-slate-300">{songSummary.fileName}</strong> — {songSummary.existingTracks.length} active track(s) on channels [{songSummary.usedChannels.map((c) => c + 1).join(', ')}]
-                  </div>
-                  <div className="text-[10px] text-slate-500 font-mono truncate">
-                    Harmony digest: {songSummary.barDigest.slice(0, 4).join(' | ')}
-                  </div>
-                </div>
-              ) : (
-                <p className="text-[11px] text-amber-400">
-                  No MIDI loaded. Load a demo song or create a new MIDI first.
-                </p>
-              )}
-            </div>
+        )}
 
-            {/* Stem Quick Chips */}
+        {mode === 'add_track' && (
+          <div className="space-y-3 mb-4">
+            {renderSongAnalysisCard(songSummary)}
+
             <div>
               <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 block mb-1.5">
                 Quick Stem Ideas
@@ -429,12 +621,166 @@ export const AiComposerModal: React.FC<AiComposerModalProps> = ({
           </div>
         )}
 
+        {mode === 'remix' && (
+          <div className="space-y-3 mb-4">
+            {renderSongAnalysisCard(songSummary)}
+
+            {/* Remix Genre / Style Presets */}
+            <div>
+              <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 block mb-1.5">
+                Remix Genre Styles
+              </span>
+              <div className="flex flex-wrap gap-1.5">
+                {REMIX_PRESETS.map((preset) => (
+                  <button
+                    key={preset.label}
+                    type="button"
+                    onClick={() => {
+                      setRemixStyle(preset.style);
+                      setTargetBpm(preset.bpm);
+                      setPrompt(preset.prompt);
+                    }}
+                    className={`px-2.5 py-1 rounded-md text-[11px] font-medium border transition-colors ${
+                      remixStyle === preset.style
+                        ? 'bg-violet-600/30 border-violet-500 text-violet-200'
+                        : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700'
+                    }`}
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Remix Scope + Tempo + Bars */}
+            <div className="bg-slate-950 p-3 rounded-xl border border-slate-800 space-y-3 text-xs">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => setRemixScope('full')}
+                  className={`p-2.5 rounded-lg border text-left transition-all ${
+                    remixScope === 'full'
+                      ? 'bg-violet-950/60 border-violet-500 text-white'
+                      : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <div className="font-semibold text-xs">Full Arrangement Remix</div>
+                  <div className="text-[10px] text-slate-400 mt-0.5">
+                    Reimagines all instruments &amp; drums from the analyzed chords &amp; motifs.
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setRemixScope('keep_selected')}
+                  className={`p-2.5 rounded-lg border text-left transition-all ${
+                    remixScope === 'keep_selected'
+                      ? 'bg-violet-950/60 border-violet-500 text-white'
+                      : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <div className="font-semibold text-xs">Keep Selected Tracks + New Backing</div>
+                  <div className="text-[10px] text-slate-400 mt-0.5">
+                    Preserves chosen original track(s) intact &amp; replaces the rest with AI stems.
+                  </div>
+                </button>
+              </div>
+
+              {remixScope === 'full' ? (
+                <label className="flex items-center gap-2 text-[11px] text-slate-300 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={preserveMelody}
+                    onChange={(e) => setPreserveMelody(e.target.checked)}
+                    className="rounded border-slate-700 bg-slate-900 text-violet-500 focus:ring-0"
+                  />
+                  <span>Preserve original chord progression &amp; melody motifs in the remix</span>
+                </label>
+              ) : (
+                songSummary && (
+                  <div className="space-y-1.5">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block">
+                      Select Original Tracks to Keep Intact ({keepTrackIndices.length} kept):
+                    </span>
+                    <div className="max-h-28 overflow-y-auto grid grid-cols-1 sm:grid-cols-2 gap-1.5 pr-1">
+                      {songSummary.existingTracks
+                        .filter((t) => t.noteCount > 0)
+                        .map((track) => {
+                          const isKept = keepTrackIndices.includes(track.index);
+                          return (
+                            <button
+                              key={track.index}
+                              type="button"
+                              onClick={() => toggleKeepTrack(track.index)}
+                              className={`flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-md border text-left text-[11px] transition-colors ${
+                                isKept
+                                  ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-200'
+                                  : 'bg-slate-900 border-slate-800 text-slate-400 hover:border-slate-700'
+                              }`}
+                            >
+                              <div className="truncate">
+                                <span className="font-semibold">{track.name}</span>{' '}
+                                <span className="text-[10px] opacity-75">
+                                  ({track.role}, {track.noteCount}n)
+                                </span>
+                              </div>
+                              <span
+                                className={`w-4 h-4 rounded flex items-center justify-center shrink-0 ${
+                                  isKept ? 'bg-emerald-500 text-slate-950' : 'bg-slate-800'
+                                }`}
+                              >
+                                {isKept && <Check className="w-3 h-3" />}
+                              </span>
+                            </button>
+                          );
+                        })}
+                    </div>
+                  </div>
+                )
+              )}
+
+              <div className="grid grid-cols-2 gap-2.5 pt-1 border-t border-slate-800/80">
+                <div>
+                  <label className="text-[10px] text-slate-400 uppercase font-bold block mb-1">
+                    Remix Tempo (BPM)
+                  </label>
+                  <input
+                    type="number"
+                    min={40}
+                    max={220}
+                    value={targetBpm}
+                    onChange={(e) => setTargetBpm(Number(e.target.value) || 120)}
+                    className="w-full bg-slate-900 border border-slate-700 rounded-md px-2 py-1 text-white font-mono focus:outline-none focus:border-violet-500"
+                  />
+                </div>
+                <div>
+                  <label className="text-[10px] text-slate-400 uppercase font-bold block mb-1">
+                    Section Length (Bars)
+                  </label>
+                  <select
+                    value={remixBars}
+                    onChange={(e) => setRemixBars(Number(e.target.value))}
+                    className="w-full bg-slate-900 border border-slate-700 rounded-md px-2 py-1 text-white font-mono focus:outline-none focus:border-violet-500"
+                  >
+                    {[4, 8, 12, 16, 24].map((bars) => (
+                      <option key={bars} value={bars}>
+                        {bars} bars
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Prompt Textarea */}
         <div className="space-y-1.5 mb-4">
           <label className="text-xs font-semibold text-slate-300 block">
             {mode === 'create'
               ? 'Describe the MIDI arrangement you want to create:'
-              : 'Describe the track, drum groove, or instrument stem to add:'}
+              : mode === 'add_track'
+                ? 'Describe the track, drum groove, or instrument stem to add:'
+                : 'Describe how you want the AI to remix or re-arrange this song:'}
           </label>
           <textarea
             rows={3}
@@ -443,7 +789,9 @@ export const AiComposerModal: React.FC<AiComposerModalProps> = ({
             placeholder={
               mode === 'create'
                 ? 'e.g. Soulful Neo-Soul chord progression with Rhodes piano, finger bass, crisp rimshot drums, and synth lead...'
-                : 'e.g. Add a syncopated brass horn section and shaker percussion groove...'
+                : mode === 'add_track'
+                  ? 'e.g. Add a syncopated brass horn section and shaker percussion groove...'
+                  : 'e.g. Remix into a mellow Lo-Fi Chillhop groove with Rhodes chords and swung drums...'
             }
             className="w-full rounded-xl bg-slate-950 border border-slate-800 focus:border-indigo-500 p-3 text-sm text-white placeholder-slate-500 focus:outline-none resize-none"
           />
@@ -460,15 +808,18 @@ export const AiComposerModal: React.FC<AiComposerModalProps> = ({
         {/* Success Result Card */}
         {lastResult && (
           <div className="mb-4 p-3.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-xs space-y-2">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-2 font-bold text-emerald-300">
-                <CheckCircle2 className="w-4 h-4" />
-                <span>Loaded into Workstation: {lastResult.title}</span>
+                <CheckCircle2 className="w-4 h-4 shrink-0" />
+                <span>
+                  Loaded into Workstation: {lastResult.title}
+                  {lastResult.keptCount ? ` (${lastResult.keptCount} original track kept)` : ''}
+                </span>
               </div>
               <button
                 type="button"
                 onClick={() => audioEngine.exportCurrentMidi()}
-                className="flex items-center gap-1 px-2.5 py-1 rounded-md bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-[11px] transition-colors"
+                className="flex items-center gap-1 px-2.5 py-1 rounded-md bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-[11px] transition-colors shrink-0"
               >
                 <Download className="w-3 h-3" />
                 <span>Download .mid</span>
@@ -490,7 +841,7 @@ export const AiComposerModal: React.FC<AiComposerModalProps> = ({
         {/* Footer Actions */}
         <div className="flex flex-wrap items-center justify-between gap-2 pt-4 border-t border-slate-800">
           <div className="flex items-center gap-2">
-            {canUndo && (
+            {undoCount > 0 && (
               <button
                 type="button"
                 onClick={handleUndo}
@@ -498,7 +849,7 @@ export const AiComposerModal: React.FC<AiComposerModalProps> = ({
                 className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-amber-300 border border-slate-700 transition-colors"
               >
                 <RotateCcw className="w-3.5 h-3.5" />
-                <span>Undo AI Edit</span>
+                <span>Undo AI Edit{undoCount > 1 ? ` (${undoCount})` : ''}</span>
               </button>
             )}
             <button
@@ -524,18 +875,24 @@ export const AiComposerModal: React.FC<AiComposerModalProps> = ({
             <button
               type="button"
               onClick={handleGenerate}
-              disabled={isGenerating || (mode === 'add_track' && !songSummary)}
+              disabled={isGenerating || ((mode === 'add_track' || mode === 'remix') && !songSummary)}
               className="flex items-center gap-2 px-5 py-2 rounded-lg bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 disabled:opacity-50 text-white font-semibold text-xs transition-all shadow-md shadow-indigo-600/30 cursor-pointer"
             >
               {isGenerating ? (
                 <>
                   <Loader2 className="w-4 h-4 animate-spin" />
-                  <span>Composing MIDI...</span>
+                  <span>{mode === 'remix' ? 'Remixing Arrangement...' : 'Composing MIDI...'}</span>
                 </>
               ) : (
                 <>
-                  <Wand2 className="w-4 h-4" />
-                  <span>{mode === 'create' ? 'Generate & Play MIDI' : 'Generate & Merge Track'}</span>
+                  {mode === 'remix' ? <RefreshCw className="w-4 h-4" /> : <Wand2 className="w-4 h-4" />}
+                  <span>
+                    {mode === 'create'
+                      ? 'Generate & Play MIDI'
+                      : mode === 'add_track'
+                        ? 'Generate & Merge Track'
+                        : 'Remix & Play MIDI'}
+                  </span>
                 </>
               )}
             </button>

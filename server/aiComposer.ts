@@ -125,34 +125,125 @@ Musical & Technical Rules:
    - Ensure every bar from Bar 1 through totalBars has cohesive musical content unless intentionally dropping out for arrangement contrast.
    - Never leave a track empty.`;
 
+function formatBarAnalysis(req: AiComposeRequest, targetBars: number): string {
+  const s = req.songSummary;
+  if (!s) return '(none)';
+  if (Array.isArray(s.barDetails) && s.barDetails.length > 0) {
+    return s.barDetails
+      .slice(0, targetBars)
+      .map(
+        (b) =>
+          `Bar ${b.bar}: Chord=${b.chordSymbol} | Bass=${b.bassNote ?? '-'} | Motif=[${b.melodyMotif}] (${b.density})`
+      )
+      .join('\n');
+  }
+  return (s.barDigest || []).slice(0, targetBars).join('\n');
+}
+
 function buildPrompt(req: AiComposeRequest): string {
+  if (req.mode === 'remix' && req.songSummary) {
+    const s = req.songSummary;
+    const beatsPerBar = s.timeSignatureNumerator * (4 / s.timeSignatureDenominator);
+    const targetBars = Math.min(Math.max(4, req.targetBars || s.totalBars || 8), 24);
+    const targetBpm = req.targetBpm && req.targetBpm > 0 ? req.targetBpm : s.bpm;
+    const scope = req.remixScope || 'full';
+    const keepSet = new Set(req.keepTrackIndices || []);
+    const styleLabel = req.remixStyle || 'modern genre-bent remix';
+
+    const keptTracks = s.existingTracks.filter((t) => keepSet.has(t.index));
+    const keptChannels = Array.from(
+      new Set(keptTracks.flatMap((t) => t.channels))
+    ).sort((a, b) => a - b);
+
+    const trackList = s.existingTracks
+      .map(
+        (t) =>
+          `- [${keepSet.has(t.index) ? 'KEEP INTACT' : 'REPLACE'}] ${t.name} (role: ${t.role}, ch ${t.channels.join(',')}, GM prog ${t.program}, range ${t.pitchRange}, ${t.noteCount} notes)`
+      )
+      .join('\n');
+
+    const barAnalysis = formatBarAnalysis(req, targetBars);
+
+    if (scope === 'keep_selected' && keptTracks.length > 0) {
+      const keptMelodicChannels = keptChannels.filter((c) => c !== 9);
+      return `TASK: REMIX & RE-ARRANGE backing tracks around preserved original track(s) in the style of "${styleLabel}".
+Timing & Structure:
+- Tempo: ${targetBpm} BPM (time signature: ${s.timeSignatureNumerator}/${s.timeSignatureDenominator}, ${beatsPerBar} beats/bar)
+- Key Center: ${s.estimatedKey || 'C Major'}
+- Length: Compose ${targetBars} bars (beat 0.0 to ${targetBars * beatsPerBar})
+- Preserved Track Channels (DO NOT REUSE melodic channels [${keptMelodicChannels.join(', ')}]):
+${trackList}
+
+Bar-by-Bar Musical Analysis of "${s.fileName}":
+${barAnalysis}
+
+User Remix Direction:
+"${req.prompt}"
+
+Instructions:
+- The tracks marked [KEEP INTACT] will remain untouched in the final MIDI. Do NOT duplicate them.
+- Return ONLY the NEW replacement backing tracks (e.g. fresh drums on channel 9 unless drums were kept, new bassline, chords/keys/synth/strings) styled as "${styleLabel}" that lock tightly with the chord progression and kept melody/tracks above.`;
+    }
+
+    const melodyRule =
+      req.preserveMelody !== false
+        ? 'Preserve and adapt the recognizable chord progression and lead melody motifs from the bar analysis while completely reimagining the groove, rhythms, voicings, and instrumentation.'
+        : 'Use the chord progression and key center as inspiration to build a bold, fresh re-arrangement.';
+
+    return `TASK: FULL ARRANGEMENT REMIX of "${s.fileName}" in the style of "${styleLabel}".
+Timing & Structure:
+- Target Tempo: ${targetBpm} BPM (Time Signature: ${s.timeSignatureNumerator}/${s.timeSignatureDenominator}, ${beatsPerBar} beats/bar)
+- Estimated Key: ${s.estimatedKey || 'C Major'}
+- Length: ${targetBars} bars (beat 0.0 to ${targetBars * beatsPerBar})
+
+Original Instrumentation:
+${trackList || '(none)'}
+
+Bar-by-Bar Harmony & Lead Motif Digest:
+${barAnalysis}
+
+User Remix Direction:
+"${req.prompt}"
+
+Instructions:
+- ${melodyRule}
+- Compose a complete, full-sounding multi-track arrangement (Drums on ch 9, Bass, Chords/Pads, and Lead/Counter-melody) that authentically embodies "${styleLabel}".`;
+  }
+
   if (req.mode === 'add_track' && req.songSummary) {
     const s = req.songSummary;
     const beatsPerBar = s.timeSignatureNumerator * (4 / s.timeSignatureDenominator);
     const targetBars = Math.min(s.totalBars, 16);
     const trackList = s.existingTracks
-      .map((t) => `- ${t.name} (ch ${t.channels.join(',')}, GM prog ${t.program}, ${t.noteCount} notes)`)
+      .map(
+        (t) =>
+          `- ${t.name} (role: ${t.role || 'instrument'}, ch ${t.channels.join(',')}, GM prog ${t.program}, range ${t.pitchRange || '-'}, ${t.noteCount} notes)`
+      )
       .join('\n');
+
+    const barAnalysis = formatBarAnalysis(req, targetBars);
 
     return `TASK: Compose 1 or 2 NEW complementary MIDI tracks/stems to layer onto an existing MIDI arrangement.
 Keep the exact tempo (${s.bpm} BPM) and time signature (${s.timeSignatureNumerator}/${s.timeSignatureDenominator}, ${beatsPerBar} beats/bar).
+Key Center: ${s.estimatedKey || 'Auto'}
 Compose notes across ${targetBars} bars (total beats: 0 to ${targetBars * beatsPerBar}).
-Do NOT reuse already occupied melodic channels: [${s.usedChannels.join(', ')}] (unless adding drums on channel 9 when appropriate).
+Do NOT reuse already occupied melodic channels: [${s.usedChannels.filter((c) => c !== 9).join(', ')}]. (Use channel 9 ONLY if adding a drum/percussion track.)
 
 Existing Song Context ("${s.fileName}"):
 - BPM: ${s.bpm}
 - Time Signature: ${s.timeSignatureNumerator}/${s.timeSignatureDenominator}
+- Estimated Key: ${s.estimatedKey || 'Unknown'}
 - Total Bars in Song: ${s.totalBars} (compose across Bars 1 to ${targetBars})
 - Existing Tracks:
 ${trackList || '(none)'}
 
-Bar-by-bar Harmonic Pitch Digest:
-${s.barDigest.slice(0, targetBars).join('\n')}
+Bar-by-Bar Harmony & Melody Analysis:
+${barAnalysis}
 
 User Request for New Track(s):
 "${req.prompt}"
 
-Return ONLY the newly composed track(s) in the tracks array, harmonizing cleanly with the pitch digest above.`;
+Return ONLY the newly composed track(s) in the tracks array, harmonizing cleanly with the detected chords and motifs above.`;
   }
 
   const bpmHint = req.bpm ? `${req.bpm} BPM` : 'appropriate BPM for the style';
