@@ -49,6 +49,59 @@ export function getPitchName(midiNote: number): string {
   return `${noteName}${octave}`;
 }
 
+export const SOLFA_DEGREE_NAMES = [
+  'Do',
+  'Di',
+  'Re',
+  'Ri',
+  'Mi',
+  'Fa',
+  'Fi',
+  'Sol',
+  'Si',
+  'La',
+  'Ta',
+  'Ti'
+];
+
+const NOTE_TO_PC: Record<string, number> = {
+  C: 0,
+  'B#': 0,
+  'C#': 1,
+  DB: 1,
+  D: 2,
+  'D#': 3,
+  EB: 3,
+  E: 4,
+  FB: 4,
+  'E#': 5,
+  F: 5,
+  'F#': 6,
+  GB: 6,
+  G: 7,
+  'G#': 8,
+  AB: 8,
+  A: 9,
+  'A#': 10,
+  BB: 10,
+  B: 11,
+  CB: 11
+};
+
+/**
+ * Maps a musical key string (e.g. "G Major", "D# Minor", "Eb Minor") to its Movable-Do major tonic (0-11).
+ * Minor keys resolve to their relative major Do (e.g. A Minor -> C = 0).
+ */
+export function getMajorDoRootFromKeyName(keyName: string): number {
+  const cleaned = (keyName || '').trim();
+  const match = cleaned.match(/^([A-G][#b]?)\s*(major|minor|maj|min)?/i);
+  if (!match) return 0;
+  const noteToken = match[1].toUpperCase();
+  const modeToken = (match[2] || 'major').toLowerCase();
+  const pc = NOTE_TO_PC[noteToken] ?? 0;
+  return modeToken.startsWith('min') ? (pc + 3) % 12 : pc;
+}
+
 /**
  * Calculates Movable-Do Solfa notation for a given MIDI note based on key root
  */
@@ -78,3 +131,4 @@ export function getSolfaInfo(midiNote: number, rootKeyIndex: number = 0): SolfaI
     octaveOffset: relativeOctave
   };
 }
+

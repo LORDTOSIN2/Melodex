@@ -4,14 +4,16 @@
  */
 
 import React, { useRef, useState } from 'react';
-import { Volume2, X, Upload, Check, RefreshCw, FileText, HardDrive, Zap, Trash2 } from 'lucide-react';
+import { Volume2, X, Upload, HardDrive, Zap, Trash2, Mic } from 'lucide-react';
 import { audioEngine } from '../services/audioEngine';
-import { SoundFontMeta } from '../types/midi';
+import { SOLFA_DEGREE_NAMES } from '../services/solfaService';
+import { SoundFontMeta, SolfegeBankMeta } from '../types/midi';
 
 interface SoundFontModalProps {
   isOpen: boolean;
   onClose: () => void;
   soundFonts: SoundFontMeta[];
+  solfegeBankMeta: SolfegeBankMeta | null;
   isSoundFontLoaded: boolean;
 }
 
@@ -19,9 +21,11 @@ export const SoundFontModal: React.FC<SoundFontModalProps> = ({
   isOpen,
   onClose,
   soundFonts,
+  solfegeBankMeta,
   isSoundFontLoaded
 }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const solfegeInputRef = useRef<HTMLInputElement>(null);
   const [loadingStatus, setLoadingStatus] = useState<{ progress: number; message: string } | null>(null);
 
   if (!isOpen) return null;
@@ -65,6 +69,29 @@ export const SoundFontModal: React.FC<SoundFontModalProps> = ({
     await audioEngine.clearSoundFontCache();
     setLoadingStatus({ progress: 100, message: 'Browser SoundFont cache cleared from IndexedDB.' });
     setTimeout(() => setLoadingStatus(null), 2500);
+  };
+
+  const handleSolfegeUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      setLoadingStatus({ progress: 15, message: `Layering Solfege SF2 (${file.name})...` });
+      await audioEngine.loadSolfegeSoundFont(file, (progress, message) => {
+        setLoadingStatus({ progress, message });
+      });
+      setTimeout(() => setLoadingStatus(null), 1600);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setLoadingStatus({ progress: 100, message: `Solfege SF2 Error: ${msg}` });
+      setTimeout(() => setLoadingStatus(null), 3500);
+    }
+    e.target.value = '';
+  };
+
+  const handleRemoveSolfege = async () => {
+    await audioEngine.removeSolfegeSoundFont();
+    setLoadingStatus({ progress: 100, message: 'Removed layered Solfege vocal bank.' });
+    setTimeout(() => setLoadingStatus(null), 2000);
   };
 
   const activeFont = soundFonts[0];
@@ -180,17 +207,17 @@ export const SoundFontModal: React.FC<SoundFontModalProps> = ({
           </div>
         </div>
 
-        {/* Drag-and-drop / Custom Upload Area */}
+        {/* Drag-and-drop / Custom Upload Area (Main Bank 0) */}
         <div
           onClick={() => fileInputRef.current?.click()}
-          className="border-2 border-dashed border-slate-700 hover:border-indigo-500 rounded-xl p-4 text-center cursor-pointer bg-slate-950/40 hover:bg-slate-950 transition-colors my-3 group"
+          className="border-2 border-dashed border-slate-700 hover:border-indigo-500 rounded-xl p-3.5 text-center cursor-pointer bg-slate-950/40 hover:bg-slate-950 transition-colors my-3 group"
         >
-          <Upload className="w-6 h-6 text-slate-500 group-hover:text-indigo-400 mx-auto mb-1.5 transition-colors" />
+          <Upload className="w-5 h-5 text-slate-500 group-hover:text-indigo-400 mx-auto mb-1 transition-colors" />
           <p className="text-xs font-semibold text-slate-200">
-            Import Custom SoundFont (.sf2 or .sf3)
+            Import Custom Main SoundFont (.sf2 or .sf3)
           </p>
           <p className="text-[11px] text-slate-500 mt-0.5">
-            Drop any custom soundbank (e.g. 5MB TimGM6mb or specialized piano soundfonts).
+            Replaces or supplements Bank 0 General MIDI instruments.
           </p>
           <input
             ref={fileInputRef}
@@ -199,6 +226,88 @@ export const SoundFontModal: React.FC<SoundFontModalProps> = ({
             className="hidden"
             onChange={handleFileUpload}
           />
+        </div>
+
+        {/* Layered Solfege Vocal SoundBank (Bank Offset 100) */}
+        <div className="my-3 p-3.5 rounded-xl bg-cyan-950/20 border border-cyan-500/30 space-y-2.5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <div className="w-7 h-7 rounded-lg bg-cyan-500/20 text-cyan-300 flex items-center justify-center border border-cyan-500/30">
+                <Mic className="w-3.5 h-3.5" />
+              </div>
+              <div>
+                <h3 className="text-xs font-bold text-cyan-100">
+                  Layered Solfege Vocal Bank (Bank 100 • Polyphonic)
+                </h3>
+                <p className="text-[10px] text-cyan-300/75">
+                  Uses 12 syllable presets (Programs 0–11: Do–Ti). GeneralUser GS stays active on Bank 0 for drums &amp; accompaniment.
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => solfegeInputRef.current?.click()}
+                className="px-2.5 py-1.5 rounded-md bg-cyan-600 hover:bg-cyan-500 text-white text-[11px] font-semibold transition-colors cursor-pointer"
+              >
+                {solfegeBankMeta ? 'Replace Solfege .sf2' : 'Load Solfege .sf2'}
+              </button>
+              {solfegeBankMeta && (
+                <button
+                  type="button"
+                  onClick={handleRemoveSolfege}
+                  className="px-2 py-1.5 rounded-md bg-slate-800 hover:bg-rose-600/80 text-slate-300 hover:text-white text-[11px] font-medium transition-colors"
+                  title="Unload Solfege Vocal SoundFont"
+                >
+                  Remove
+                </button>
+              )}
+            </div>
+            <input
+              ref={solfegeInputRef}
+              type="file"
+              accept=".sf2,.sf3"
+              className="hidden"
+              onChange={handleSolfegeUpload}
+            />
+          </div>
+
+          {solfegeBankMeta ? (
+            <div className="bg-slate-950/70 rounded-lg p-2.5 border border-slate-800 text-[11px] space-y-1.5">
+              <div className="flex items-center justify-between text-slate-300">
+                <span className="font-semibold truncate">{solfegeBankMeta.name}</span>
+                <span className="font-mono text-[10px] text-cyan-400">
+                  {(solfegeBankMeta.sizeBytes / (1024 * 1024)).toFixed(2)} MB • {solfegeBankMeta.detectedDegrees.length}/12 presets
+                </span>
+              </div>
+              <div className="flex flex-wrap gap-1">
+                {SOLFA_DEGREE_NAMES.map((syllable, deg) => {
+                  const found = solfegeBankMeta.detectedDegrees.includes(deg);
+                  return (
+                    <span
+                      key={deg}
+                      title={
+                        found
+                          ? `Program ${deg}: ${solfegeBankMeta.presetNames[deg]}`
+                          : `Program ${deg} missing (uses nearest syllable fallback)`
+                      }
+                      className={`px-1.5 py-0.5 rounded text-[10px] font-mono border ${
+                        found
+                          ? 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30'
+                          : 'bg-slate-900 text-slate-500 border-slate-800'
+                      }`}
+                    >
+                      {deg}:{syllable}
+                    </span>
+                  );
+                })}
+              </div>
+            </div>
+          ) : (
+            <p className="text-[11px] text-slate-400">
+              No Solfege SoundFont loaded yet. Upload a `.sf2` with Programs 0–11 mapped to Do, Di, Re, Ri, Mi, Fa, Fi, Sol, Si, La, Ta, Ti, then toggle <strong className="text-cyan-300">Solfa Sing</strong> on any channel in the Mixer.
+            </p>
+          )}
         </div>
 
         {/* Footer actions */}

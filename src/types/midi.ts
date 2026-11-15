@@ -25,6 +25,7 @@ export interface ChannelState {
   isMuted: boolean;
   isSoloed: boolean;
   presetLocked: boolean;
+  isSolfaVocal: boolean;
   activityLevel: number; // 0.0 - 1.0 for VU meter decay
   activeNotes: Set<number>;
 }
@@ -37,6 +38,15 @@ export interface SoundFontMeta {
   presetCount: number;
   isCachedLocally?: boolean;
   format?: 'sf2' | 'sf3' | 'custom';
+}
+
+export interface SolfegeBankMeta {
+  id: string;
+  name: string;
+  sizeBytes: number;
+  bankOffset: number;
+  detectedDegrees: number[];
+  presetNames: Record<number, string>;
 }
 
 export interface BenchmarkMetrics {

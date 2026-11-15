@@ -4,7 +4,7 @@
  */
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { ChevronLeft, ChevronRight, Eye, Music, Volume2, Sparkles } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Eye, Music, Volume2, Sparkles, Mic } from 'lucide-react';
 import { audioEngine } from '../services/audioEngine';
 import { getPitchName, getSolfaInfo, KEY_CENTERS } from '../services/solfaService';
 import { GM_INSTRUMENTS } from '../services/gmInstruments';
@@ -65,7 +65,7 @@ export const VirtualPiano: React.FC<VirtualPianoProps> = ({
   const [totalVisibleKeys, setTotalVisibleKeys] = useState<number>(49); // 25, 49, 61, 76, 88
   const [startKeyIndex, setStartKeyIndex] = useState<number>(36); // Note 36 (C2)
   const [solfaMode, setSolfaMode] = useState<SolfaMode>('both'); // 'pitch' | 'solfa' | 'both'
-  const [rootKeyIndex, setRootKeyIndex] = useState<number>(0); // 0 = C Major
+  const [rootKeyIndex, setRootKeyIndex] = useState<number>(() => audioEngine.getSolfaRootKey()); // synced Movable-Do root
   const [activeNotesMap, setActiveNotesMap] = useState<Map<number, number>>(new Map()); // midiNote -> channel
   const [keyboardShortcutOctaveShift, setKeyboardShortcutOctaveShift] = useState<number>(0); // -2 to +2
 
@@ -76,9 +76,9 @@ export const VirtualPiano: React.FC<VirtualPianoProps> = ({
   const [mouseActiveNote, setMouseActiveNote] = useState<number | null>(null);
   const isMouseDownRef = useRef(false);
 
-  // Subscribe to real-time note events from audio engine
+  // Subscribe to real-time note events & Movable-Do key changes from audio engine
   useEffect(() => {
-    const unsubscribe = audioEngine.onNoteEvent((channel, midiNote, velocity, isNoteOn) => {
+    const unsubscribeNotes = audioEngine.onNoteEvent((channel, midiNote, velocity, isNoteOn) => {
       setActiveNotesMap((prev) => {
         const next = new Map(prev);
         if (isNoteOn) {
@@ -90,7 +90,14 @@ export const VirtualPiano: React.FC<VirtualPianoProps> = ({
       });
     });
 
-    return () => unsubscribe();
+    const unsubscribeKey = audioEngine.onSolfaKeyChange((newRootKey) => {
+      setRootKeyIndex(newRootKey);
+    });
+
+    return () => {
+      unsubscribeNotes();
+      unsubscribeKey();
+    };
   }, []);
 
   // Computer keyboard musical typing
@@ -220,12 +227,22 @@ export const VirtualPiano: React.FC<VirtualPianoProps> = ({
               onChange={(e) => onChannelSelect(parseInt(e.target.value))}
               className="bg-slate-800 text-white rounded px-2 py-0.5 border border-slate-700 font-mono focus:outline-none"
             >
-              {Array.from({ length: 16 }, (_, i) => (
-                <option key={i} value={i}>
-                  Ch {i + 1} {i === 9 ? '(Drums)' : `(${GM_INSTRUMENTS[audioEngine.getChannels()[i]?.program || 0]})`}
-                </option>
-              ))}
+              {Array.from({ length: 16 }, (_, i) => {
+                const ch = audioEngine.getChannels()[i];
+                const instr = i === 9 ? 'Drums' : ch?.isSolfaVocal ? 'Solfa Vocal' : GM_INSTRUMENTS[ch?.program || 0];
+                return (
+                  <option key={i} value={i}>
+                    Ch {i + 1} ({instr})
+                  </option>
+                );
+              })}
             </select>
+            {audioEngine.getChannels()[selectedChannel]?.isSolfaVocal && (
+              <span className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 text-[10px] font-semibold">
+                <Mic className="w-2.5 h-2.5" />
+                Solfa
+              </span>
+            )}
           </div>
         </div>
 
@@ -256,7 +273,11 @@ export const VirtualPiano: React.FC<VirtualPianoProps> = ({
             <span className="text-slate-400">Key Center (Do):</span>
             <select
               value={rootKeyIndex}
-              onChange={(e) => setRootKeyIndex(parseInt(e.target.value))}
+              onChange={(e) => {
+                const next = parseInt(e.target.value);
+                setRootKeyIndex(next);
+                audioEngine.setSolfaRootKey(next);
+              }}
               className="bg-slate-800 text-white rounded px-2 py-0.5 border border-slate-700 font-medium focus:outline-none"
             >
               {KEY_CENTERS.map((k) => (

@@ -4,11 +4,58 @@
  */
 
 import { WorkletSynthesizer, Sequencer } from 'spessasynth_lib';
-import { BasicMIDI } from 'spessasynth_core';
-import { ChannelState, TrackInfo, SoundFontMeta, BenchmarkMetrics, SequencerNote, MidiSongSummary } from '../types/midi';
+import {
+  BasicMIDI,
+  MIDIMessage,
+  MIDIMessageTypes,
+  MIDITrack,
+  SoundBankLoader,
+  type MIDIMessageType
+} from 'spessasynth_core';
+import {
+  ChannelState,
+  TrackInfo,
+  SoundFontMeta,
+  BenchmarkMetrics,
+  SequencerNote,
+  MidiSongSummary,
+  SolfegeBankMeta
+} from '../types/midi';
 import { GM_INSTRUMENTS } from './gmInstruments';
 import { soundFontStorage } from './soundFontStorage';
 import { downloadMidiBuffer, summarizeMidiForAi } from './midiCompiler';
+import { getMajorDoRootFromKeyName, SOLFA_DEGREE_NAMES } from './solfaService';
+
+const SOLFEGE_BANK_ID = 'solfege_vocal';
+const SOLFEGE_STORAGE_KEY = 'solfege_vocal_sf2';
+const SOLFEGE_BANK_OFFSET = 100;
+
+interface SolfegePatchTarget {
+  bankMSB: number;
+  bankLSB: number;
+  program: number;
+  name: string;
+}
+
+const CHROMATIC_FALLBACK_DEGREE: Record<number, number[]> = {
+  0: [0],
+  1: [0, 2],
+  2: [2, 0],
+  3: [4, 2],
+  4: [4, 2],
+  5: [5, 4],
+  6: [5, 7],
+  7: [7, 5],
+  8: [7, 9],
+  9: [9, 7],
+  10: [11, 9],
+  11: [11, 9]
+};
+
+function degreeToSolfaSubChannel(degree: number): number {
+  // Skip sub-channel 9 so SpessaSynth never treats degree 9 ("La") as a drum channel
+  return degree >= 9 ? degree + 1 : degree;
+}
 
 export type NoteEventCallback = (channel: number, midiNote: number, velocity: number, isNoteOn: boolean) => void;
 export type TransportCallback = (currentTime: number, duration: number, isPlaying: boolean, tempoBpm: number) => void;
@@ -27,6 +74,15 @@ class AudioEngine {
   private rawMidiBuffer: ArrayBuffer | null = null;
   private currentMidiName: string = '';
   private aiUndoStack: { buffer: ArrayBuffer; name: string }[] = [];
+
+  // Layered Solfege Vocal SoundFont (Bank Offset 100, 12 Movable-Do Syllable Presets)
+  private solfegeBankMeta: SolfegeBankMeta | null = null;
+  private solfegePresetMap: Record<number, SolfegePatchTarget> = {};
+  private solfaRootKey: number = 0; // 0 = C Major / A Minor
+  private solfegeBaseSynthChannel: number = 16;
+  private interactiveSolfaNotes = new Map<string, number>(); // `${uiCh}:${midiNote}` -> synthCh
+  private solfaActivePitchToUiChannel = new Map<number, number[]>(); // midiNote -> stack of uiCh
+  private solfaKeyListeners = new Set<(rootKey: number) => void>();
 
   // Channel & Track State
   private channels: ChannelState[] = [];
@@ -56,6 +112,7 @@ class AudioEngine {
   }
 
   private initDefaultChannels() {
+    const prevSolfaFlags = this.channels.map((c) => Boolean(c.isSolfaVocal));
     this.channels = Array.from({ length: 16 }, (_, i) => ({
       channelNumber: i,
       name: i === 9 ? 'Channel 10 (Drums)' : `Channel ${i + 1}`,
@@ -67,6 +124,7 @@ class AudioEngine {
       isMuted: false,
       isSoloed: false,
       presetLocked: false,
+      isSolfaVocal: i === 9 ? false : (prevSolfaFlags[i] ?? false),
       activityLevel: 0,
       activeNotes: new Set<number>()
     }));
@@ -100,6 +158,9 @@ class AudioEngine {
       // Start transport and benchmark pollers
       this.startPollingLoops();
 
+      // Pre-allocate Port 1 channels (16..31) for zero-latency polyphonic Solfege voices
+      this.ensureSolfegeSynthChannels();
+
       this.isInitialized = true;
     } finally {
       this.isInitializing = false;
@@ -116,9 +177,19 @@ class AudioEngine {
         const channelObj = this.channels[ch];
         channelObj.activeNotes.add(event.midiNote);
         channelObj.activityLevel = Math.max(channelObj.activityLevel, event.velocity / 127);
+        this.notifyNoteEvent(ch, event.midiNote, event.velocity, true);
+        this.notifyChannelUpdate();
+      } else if (ch >= this.solfegeBaseSynthChannel && ch < this.solfegeBaseSynthChannel + 16) {
+        // Map hidden polyphonic Solfa port channel back to its source mixer channel for visualizers
+        const visualCh = this.resolveSolfaVisualChannel(event.midiNote);
+        if (visualCh !== null) {
+          const channelObj = this.channels[visualCh];
+          channelObj.activeNotes.add(event.midiNote);
+          channelObj.activityLevel = Math.max(channelObj.activityLevel, event.velocity / 127);
+          this.notifyNoteEvent(visualCh, event.midiNote, event.velocity, true);
+          this.notifyChannelUpdate();
+        }
       }
-      this.notifyNoteEvent(ch, event.midiNote, event.velocity, true);
-      this.notifyChannelUpdate();
     });
 
     // Note Off
@@ -126,9 +197,16 @@ class AudioEngine {
       const ch = event.channel;
       if (ch < this.channels.length) {
         this.channels[ch].activeNotes.delete(event.midiNote);
+        this.notifyNoteEvent(ch, event.midiNote, 0, false);
+        this.notifyChannelUpdate();
+      } else if (ch >= this.solfegeBaseSynthChannel && ch < this.solfegeBaseSynthChannel + 16) {
+        const visualCh = this.resolveSolfaVisualChannel(event.midiNote);
+        if (visualCh !== null) {
+          this.channels[visualCh].activeNotes.delete(event.midiNote);
+          this.notifyNoteEvent(visualCh, event.midiNote, 0, false);
+          this.notifyChannelUpdate();
+        }
       }
-      this.notifyNoteEvent(ch, event.midiNote, 0, false);
-      this.notifyChannelUpdate();
     });
 
     // Program Change
@@ -310,6 +388,9 @@ class AudioEngine {
       }
     ];
 
+    // Also restore layered Solfege Vocal SoundFont if cached in IndexedDB
+    await this.restoreCachedSolfegeSoundFont();
+
     onProgress?.(
       100,
       loadedFromCache
@@ -358,6 +439,249 @@ class AudioEngine {
     await soundFontStorage.deleteSoundFont('generaluser_full_sf2');
   }
 
+  // --- Layered Solfege Vocal SoundFont (Bank Offset 100, 12 Presets 0..11) ---
+
+  private ensureSolfegeSynthChannels(): void {
+    if (!this.synth) return;
+    const targetCount = 32;
+    const currentCount = this.synth.midiChannels.length;
+    for (let i = currentCount; i < targetCount; i++) {
+      this.synth.addNewChannel();
+    }
+  }
+
+  private buildSolfegePresetMapFromBuffer(buffer: ArrayBuffer): {
+    detectedDegrees: number[];
+    presetNames: Record<number, string>;
+    presetMap: Record<number, SolfegePatchTarget>;
+  } {
+    const bank = SoundBankLoader.fromArrayBuffer(buffer.slice(0));
+    const availableByProg = new Map<number, SolfegePatchTarget>();
+
+    for (const p of bank.presets) {
+      if (p.isGMGSDrum) continue;
+      const existing = availableByProg.get(p.program);
+      // Prefer bank 0 presets for programs 0..11, or store any first match
+      if (!existing || p.bankMSB < existing.bankMSB - SOLFEGE_BANK_OFFSET) {
+        availableByProg.set(p.program, {
+          bankMSB: Math.min(127, p.bankMSB + SOLFEGE_BANK_OFFSET),
+          bankLSB: p.bankLSB || 0,
+          program: p.program,
+          name: p.name || SOLFA_DEGREE_NAMES[p.program] || `Preset ${p.program}`
+        });
+      }
+    }
+
+    const detectedDegrees: number[] = [];
+    const presetNames: Record<number, string> = {};
+    const presetMap: Record<number, SolfegePatchTarget> = {};
+
+    for (let deg = 0; deg < 12; deg++) {
+      const exact = availableByProg.get(deg);
+      if (exact) {
+        detectedDegrees.push(deg);
+        presetNames[deg] = exact.name;
+        presetMap[deg] = exact;
+      }
+    }
+
+    // Build smart fallbacks for any missing chromatic syllables (e.g. 7-note major-only SF2s)
+    const anyAvailable = availableByProg.get(0) ?? Array.from(availableByProg.values())[0];
+    for (let deg = 0; deg < 12; deg++) {
+      if (!presetMap[deg]) {
+        const candidates = CHROMATIC_FALLBACK_DEGREE[deg] || [0];
+        let chosen: SolfegePatchTarget | undefined;
+        for (const c of candidates) {
+          if (availableByProg.has(c)) {
+            chosen = availableByProg.get(c);
+            break;
+          }
+        }
+        presetMap[deg] = chosen ?? anyAvailable ?? {
+          bankMSB: SOLFEGE_BANK_OFFSET,
+          bankLSB: 0,
+          program: deg,
+          name: SOLFA_DEGREE_NAMES[deg]
+        };
+      }
+    }
+
+    return { detectedDegrees, presetNames, presetMap };
+  }
+
+  private async registerSolfegeBuffer(
+    buffer: ArrayBuffer,
+    fileName: string,
+    saveToCache: boolean
+  ): Promise<SolfegeBankMeta> {
+    if (!this.synth) throw new Error('Synth not initialized');
+    this.ensureSolfegeSynthChannels();
+
+    const { detectedDegrees, presetNames, presetMap } = this.buildSolfegePresetMapFromBuffer(buffer);
+    this.solfegePresetMap = presetMap;
+
+    if (saveToCache) {
+      await soundFontStorage.saveSoundFont(SOLFEGE_STORAGE_KEY, fileName, buffer.slice(0));
+    }
+
+    // Layer at Bank Offset 100 so GeneralUser GS on Bank 0 remains untouched
+    await this.synth.soundBankManager.addSoundBank(
+      buffer.slice(0),
+      SOLFEGE_BANK_ID,
+      SOLFEGE_BANK_OFFSET
+    );
+    await this.synth.isReady;
+
+    const meta: SolfegeBankMeta = {
+      id: SOLFEGE_BANK_ID,
+      name: fileName,
+      sizeBytes: buffer.byteLength,
+      bankOffset: SOLFEGE_BANK_OFFSET,
+      detectedDegrees,
+      presetNames
+    };
+    this.solfegeBankMeta = meta;
+    this.configureSolfegeSynthChannelsFromChannel(
+      this.channels.findIndex((c) => c.isSolfaVocal) >= 0
+        ? this.channels.findIndex((c) => c.isSolfaVocal)
+        : 0
+    );
+    this.notifyChannelUpdate();
+    return meta;
+  }
+
+  private async restoreCachedSolfegeSoundFont(): Promise<void> {
+    try {
+      const cached = await soundFontStorage.getSoundFontWithMeta(SOLFEGE_STORAGE_KEY);
+      if (cached) {
+        await this.registerSolfegeBuffer(cached.buffer, cached.name, false);
+      }
+    } catch (err) {
+      console.warn('Could not restore cached Solfege SoundFont:', err);
+    }
+  }
+
+  public async loadSolfegeSoundFont(
+    file: File,
+    onProgress?: (pct: number, msg: string) => void
+  ): Promise<SolfegeBankMeta> {
+    await this.initialize();
+    await this.resumeAudioContext();
+
+    onProgress?.(20, `Reading ${file.name}...`);
+    const buffer = await file.arrayBuffer();
+
+    onProgress?.(60, `Layering Solfege SF2 at Bank ${SOLFEGE_BANK_OFFSET} (preserving GeneralUser GS)...`);
+    const meta = await this.registerSolfegeBuffer(buffer, file.name, true);
+
+    onProgress?.(
+      100,
+      `Layered ${file.name} (${meta.detectedDegrees.length}/12 syllable presets mapped)!`
+    );
+
+    if (this.channels.some((c) => c.isSolfaVocal)) {
+      this.applyTrackFilter();
+    }
+    return meta;
+  }
+
+  public async removeSolfegeSoundFont(): Promise<void> {
+    await soundFontStorage.deleteSoundFont(SOLFEGE_STORAGE_KEY);
+    try {
+      this.synth?.soundBankManager.deleteSoundBank(SOLFEGE_BANK_ID);
+    } catch {
+      // Ignore if not loaded
+    }
+    this.solfegeBankMeta = null;
+    this.solfegePresetMap = {};
+    let hadSolfa = false;
+    this.channels.forEach((c) => {
+      if (c.isSolfaVocal) {
+        c.isSolfaVocal = false;
+        hadSolfa = true;
+      }
+    });
+    if (hadSolfa) {
+      this.applyTrackFilter();
+    }
+    this.notifyChannelUpdate();
+  }
+
+  private configureSolfegeSynthChannelsFromChannel(sourceChannel: number): void {
+    if (!this.synth || !this.solfegeBankMeta) return;
+    const src = this.channels[sourceChannel] ?? this.channels[0];
+    const panCC = Math.max(0, Math.min(127, Math.round((src.pan + 1) * 63.5)));
+
+    for (let deg = 0; deg < 12; deg++) {
+      const subCh = degreeToSolfaSubChannel(deg);
+      const synthCh = this.solfegeBaseSynthChannel + subCh;
+      const patch = this.solfegePresetMap[deg];
+      if (!patch) continue;
+      this.synth.controllerChange(synthCh, 0, patch.bankMSB);
+      this.synth.controllerChange(synthCh, 32, patch.bankLSB);
+      this.synth.programChange(synthCh, patch.program);
+      this.synth.controllerChange(synthCh, 7, src.volume);
+      this.synth.controllerChange(synthCh, 10, panCC);
+      this.synth.controllerChange(synthCh, 91, src.reverb);
+      this.synth.midiChannels[synthCh]?.setSystemParameter('keyShift', this.transposeSemitones);
+    }
+  }
+
+  private resolveSolfaVisualChannel(midiNote: number): number | null {
+    const stack = this.solfaActivePitchToUiChannel.get(midiNote);
+    if (stack && stack.length > 0) {
+      return stack[0];
+    }
+    const active = this.channels.find((c) => c.isSolfaVocal && !c.isMuted);
+    if (active) return active.channelNumber;
+    const anySolfa = this.channels.find((c) => c.isSolfaVocal);
+    return anySolfa ? anySolfa.channelNumber : null;
+  }
+
+  public setSolfaRootKey(rootKey: number): void {
+    const normalized = ((Math.round(rootKey) % 12) + 12) % 12;
+    if (this.solfaRootKey === normalized) return;
+    this.solfaRootKey = normalized;
+    for (const listener of this.solfaKeyListeners) {
+      listener(normalized);
+    }
+    if (this.solfegeBankMeta && this.channels.some((c) => c.isSolfaVocal)) {
+      this.applyTrackFilter();
+    }
+    this.notifyChannelUpdate();
+  }
+
+  public getSolfaRootKey(): number {
+    return this.solfaRootKey;
+  }
+
+  public getSolfegeBankMeta(): SolfegeBankMeta | null {
+    return this.solfegeBankMeta;
+  }
+
+  public onSolfaKeyChange(cb: (rootKey: number) => void): () => void {
+    this.solfaKeyListeners.add(cb);
+    return () => this.solfaKeyListeners.delete(cb);
+  }
+
+  public toggleChannelSolfaVocal(channel: number): boolean {
+    if (channel < 0 || channel >= 16 || channel === 9) return false;
+    if (!this.solfegeBankMeta) return false;
+
+    const next = !this.channels[channel].isSolfaVocal;
+    this.channels[channel].isSolfaVocal = next;
+
+    if (next) {
+      this.ensureSolfegeSynthChannels();
+      this.configureSolfegeSynthChannelsFromChannel(channel);
+    }
+
+    this.applyTrackFilter();
+    this.applyMuteSoloRules();
+    this.notifyChannelUpdate();
+    return true;
+  }
+
   public async loadMidi(buffer: ArrayBuffer, fileName: string): Promise<void> {
     await this.initialize();
     await this.resumeAudioContext();
@@ -369,6 +693,18 @@ class AudioEngine {
 
     // Parse with BasicMIDI from spessasynth_core
     this.currentMidi = BasicMIDI.fromArrayBuffer(buffer, fileName);
+
+    // Auto-detect song key so Movable-Do labels & Solfa singing match immediately
+    try {
+      const summary = summarizeMidiForAi(buffer, fileName);
+      const detectedDoRoot = getMajorDoRootFromKeyName(summary.estimatedKey);
+      this.solfaRootKey = detectedDoRoot;
+      for (const listener of this.solfaKeyListeners) {
+        listener(detectedDoRoot);
+      }
+    } catch {
+      // Keep current root key on fallback
+    }
 
     // Extract Track Information
     this.tracks = this.currentMidi.tracks.map((track, idx) => {
@@ -409,12 +745,16 @@ class AudioEngine {
       this.parsedNotes = [];
     }
 
-    // Reset channel states
+    // Reset channel states (preserves user Solfa channel toggles)
     this.initDefaultChannels();
 
-    // Load into sequencer
-    this.sequencer.loadNewSongList([{ binary: buffer, fileName }]);
-    this.sequencer.playbackRate = this.playbackRate;
+    // Load into sequencer (apply Solfa routing immediately if active)
+    if (this.solfegeBankMeta && this.channels.some((c) => c.isSolfaVocal)) {
+      this.applyTrackFilter();
+    } else {
+      this.sequencer.loadNewSongList([{ binary: buffer, fileName }]);
+      this.sequencer.playbackRate = this.playbackRate;
+    }
 
     // Apply transpose if set
     this.applyKeyShiftToChannels();
@@ -466,6 +806,11 @@ class AudioEngine {
       if (ch === 9) continue;
       this.synth.midiChannels[ch]?.setSystemParameter('keyShift', this.transposeSemitones);
     }
+    // Also transpose hidden polyphonic Solfa channels (0..11 degrees)
+    for (let deg = 0; deg < 12; deg++) {
+      const synthCh = this.solfegeBaseSynthChannel + degreeToSolfaSubChannel(deg);
+      this.synth.midiChannels[synthCh]?.setSystemParameter('keyShift', this.transposeSemitones);
+    }
   }
 
   public toggleLoop(): boolean {
@@ -483,6 +828,12 @@ class AudioEngine {
     const clamped = Math.max(0, Math.min(127, Math.round(volume)));
     this.channels[channel].volume = clamped;
     this.synth?.controllerChange(channel, 7, clamped);
+    if (this.channels[channel].isSolfaVocal && this.synth) {
+      for (let deg = 0; deg < 12; deg++) {
+        const synthCh = this.solfegeBaseSynthChannel + degreeToSolfaSubChannel(deg);
+        this.synth.controllerChange(synthCh, 7, clamped);
+      }
+    }
     this.notifyChannelUpdate();
   }
 
@@ -492,6 +843,12 @@ class AudioEngine {
     this.channels[channel].pan = pan;
     const ccVal = Math.max(0, Math.min(127, Math.round((pan + 1) * 63.5)));
     this.synth?.controllerChange(channel, 10, ccVal);
+    if (this.channels[channel].isSolfaVocal && this.synth) {
+      for (let deg = 0; deg < 12; deg++) {
+        const synthCh = this.solfegeBaseSynthChannel + degreeToSolfaSubChannel(deg);
+        this.synth.controllerChange(synthCh, 10, ccVal);
+      }
+    }
     this.notifyChannelUpdate();
   }
 
@@ -500,6 +857,12 @@ class AudioEngine {
     const clamped = Math.max(0, Math.min(127, Math.round(reverb)));
     this.channels[channel].reverb = clamped;
     this.synth?.controllerChange(channel, 91, clamped);
+    if (this.channels[channel].isSolfaVocal && this.synth) {
+      for (let deg = 0; deg < 12; deg++) {
+        const synthCh = this.solfegeBaseSynthChannel + degreeToSolfaSubChannel(deg);
+        this.synth.controllerChange(synthCh, 91, clamped);
+      }
+    }
     this.notifyChannelUpdate();
   }
 
@@ -536,6 +899,7 @@ class AudioEngine {
   private applyMuteSoloRules(): void {
     if (!this.synth) return;
     const hasAnySolo = this.channels.some((c) => c.isSoloed);
+    let anySolfaAudible = false;
 
     for (let ch = 0; ch < 16; ch++) {
       const channelObj = this.channels[ch];
@@ -544,7 +908,18 @@ class AudioEngine {
         shouldMute = !channelObj.isSoloed || channelObj.isMuted;
       }
       this.synth.midiChannels[ch]?.setSystemParameter('isMuted', shouldMute);
+      if (channelObj.isSolfaVocal && !shouldMute) {
+        anySolfaAudible = true;
+      }
     }
+
+    if (this.channels.some((c) => c.isSolfaVocal)) {
+      for (let deg = 0; deg < 12; deg++) {
+        const synthCh = this.solfegeBaseSynthChannel + degreeToSolfaSubChannel(deg);
+        this.synth.midiChannels[synthCh]?.setSystemParameter('isMuted', !anySolfaAudible);
+      }
+    }
+
     this.notifyChannelUpdate();
   }
 
@@ -572,34 +947,91 @@ class AudioEngine {
     if (!this.rawMidiBuffer || !this.sequencer) return;
 
     const hasAnySolo = this.tracks.some((t) => t.isSoloed);
+    const hasAnySolfaChannel = Boolean(
+      this.solfegeBankMeta && this.channels.some((c) => c.isSolfaVocal && c.channelNumber !== 9)
+    );
 
-    // If no tracks are muted or soloed and trims are default, reload original
-    const allDefault = this.tracks.every((t) => !t.isMuted && !t.isSoloed && t.velocityTrim === 1.0);
+    // If no tracks are muted/soloed, trims are default, and no Solfa vocal channels active, reload original
+    const allDefault =
+      !hasAnySolfaChannel &&
+      this.tracks.every((t) => !t.isMuted && !t.isSoloed && t.velocityTrim === 1.0);
     if (allDefault) {
       const currentTime = this.sequencer.currentTime;
       const wasPlaying = !this.sequencer.paused;
       this.sequencer.loadNewSongList([{ binary: this.rawMidiBuffer, fileName: this.currentMidiName }]);
       this.sequencer.currentTime = currentTime;
+      this.sequencer.playbackRate = this.playbackRate;
+      this.applyKeyShiftToChannels();
       if (wasPlaying) this.sequencer.play();
       return;
     }
 
-    // Non-destructively parse fresh copy of MIDI to manipulate track events
+    // Non-destructively parse fresh copy of MIDI to manipulate track events & polyphonic Solfa routing
     const filteredMidi = BasicMIDI.fromArrayBuffer(this.rawMidiBuffer, this.currentMidiName);
+    const solfaChannelSet = new Set(
+      hasAnySolfaChannel
+        ? this.channels.filter((c) => c.isSolfaVocal && c.channelNumber !== 9).map((c) => c.channelNumber)
+        : []
+    );
+
+    const solfaPort = Math.max(1, ...filteredMidi.tracks.map((t) => (t.port || 0) + 1));
+    const solfaNoteEvents: MIDIMessage[] = [];
+    let maxSolfaTick = 0;
+
     filteredMidi.tracks.forEach((track, i) => {
       const trackMeta = this.tracks[i];
       if (!trackMeta) return;
 
+      if (hasAnySolfaChannel && track.channels.size > 0) {
+        const hasPortEvent = track.events.some((e) => e.statusByte === MIDIMessageTypes.midiPort);
+        if (!hasPortEvent) {
+          track.events = [
+            new MIDIMessage(0, MIDIMessageTypes.midiPort, new Uint8Array([track.port || 0])),
+            ...track.events
+          ];
+        }
+      }
+
       const isAudible = (!hasAnySolo || trackMeta.isSoloed) && !trackMeta.isMuted;
 
       if (!isAudible) {
-        // Strip or mute NoteOn events from this track
+        // Strip NoteOn/NoteOff events from muted tracks while retaining CCs & program changes
         track.events = track.events.filter((e) => {
           const status = e.statusByte & 240;
-          return status !== 144 && status !== 128; // retain tempo, program change, and CCs so synth state remains consistent
+          return status !== 144 && status !== 128;
         });
+        return;
+      }
+
+      if (hasAnySolfaChannel) {
+        const retained: MIDIMessage[] = [];
+        for (const e of track.events) {
+          const status = e.statusByte & 240;
+          const srcCh = e.statusByte & 15;
+
+          if ((status === 144 || status === 128) && solfaChannelSet.has(srcCh)) {
+            const pitch = e.data[0] ?? 60;
+            const degree = ((pitch % 12) - this.solfaRootKey + 12) % 12;
+            const subCh = degreeToSolfaSubChannel(degree);
+            const isNoteOn = status === 144 && (e.data[1] ?? 0) > 0;
+            const chVolRatio = (this.channels[srcCh]?.volume ?? 100) / 100;
+            const vel = isNoteOn
+              ? Math.max(1, Math.min(127, Math.round((e.data[1] ?? 100) * trackMeta.velocityTrim * chVolRatio)))
+              : 0;
+            const msgStatus = ((isNoteOn ? MIDIMessageTypes.noteOn : MIDIMessageTypes.noteOff) |
+              subCh) as MIDIMessageType;
+
+            solfaNoteEvents.push(new MIDIMessage(e.ticks, msgStatus, new Uint8Array([pitch, vel])));
+            if (e.ticks > maxSolfaTick) maxSolfaTick = e.ticks;
+          } else {
+            if (trackMeta.velocityTrim !== 1.0 && status === 144 && e.data[1] > 0) {
+              e.data[1] = Math.max(1, Math.min(127, Math.round(e.data[1] * trackMeta.velocityTrim)));
+            }
+            retained.push(e);
+          }
+        }
+        track.events = retained;
       } else if (trackMeta.velocityTrim !== 1.0) {
-        // Apply velocity trim scaling
         track.events.forEach((e) => {
           if ((e.statusByte & 240) === 144 && e.data[1] > 0) {
             e.data[1] = Math.max(1, Math.min(127, Math.round(e.data[1] * trackMeta.velocityTrim)));
@@ -608,18 +1040,108 @@ class AudioEngine {
       }
     });
 
+    if (hasAnySolfaChannel && solfaNoteEvents.length > 0) {
+      const solfaTrack = new MIDITrack();
+      solfaTrack.name = 'Solfege Vocal Choir';
+      solfaTrack.port = solfaPort;
+
+      const primarySolfaCh = this.channels.find((c) => c.isSolfaVocal);
+      const vol = primarySolfaCh?.volume ?? 100;
+      const panCC = primarySolfaCh
+        ? Math.max(0, Math.min(127, Math.round((primarySolfaCh.pan + 1) * 63.5)))
+        : 64;
+      const rev = primarySolfaCh?.reverb ?? 40;
+
+      const setupEvents: MIDIMessage[] = [
+        new MIDIMessage(0, MIDIMessageTypes.midiPort, new Uint8Array([solfaPort]))
+      ];
+
+      for (let deg = 0; deg < 12; deg++) {
+        const subCh = degreeToSolfaSubChannel(deg);
+        const patch = this.solfegePresetMap[deg] ?? {
+          bankMSB: SOLFEGE_BANK_OFFSET,
+          bankLSB: 0,
+          program: deg,
+          name: SOLFA_DEGREE_NAMES[deg]
+        };
+        setupEvents.push(
+          MIDIMessage.controllerChange(0, subCh, 0, patch.bankMSB),
+          MIDIMessage.controllerChange(0, subCh, 32, patch.bankLSB),
+          MIDIMessage.programChange(0, subCh, patch.program),
+          MIDIMessage.controllerChange(0, subCh, 7, vol),
+          MIDIMessage.controllerChange(0, subCh, 10, panCC),
+          MIDIMessage.controllerChange(0, subCh, 91, rev)
+        );
+      }
+
+      solfaNoteEvents.sort((a, b) => {
+        if (a.ticks !== b.ticks) return a.ticks - b.ticks;
+        const aIsOn = (a.statusByte & 240) === 144 && (a.data[1] ?? 0) > 0;
+        const bIsOn = (b.statusByte & 240) === 144 && (b.data[1] ?? 0) > 0;
+        if (aIsOn !== bIsOn) return aIsOn ? 1 : -1;
+        return (a.data[0] ?? 0) - (b.data[0] ?? 0);
+      });
+
+      solfaTrack.pushEvents(
+        ...setupEvents,
+        ...solfaNoteEvents,
+        new MIDIMessage(maxSolfaTick + 10, MIDIMessageTypes.endOfTrack, new Uint8Array([]))
+      );
+      filteredMidi.tracks.push(solfaTrack);
+    }
+
+    filteredMidi.flush();
+    if (hasAnySolfaChannel) {
+      this.solfegeBaseSynthChannel = filteredMidi.portChannelOffsetMap[solfaPort] ?? 16;
+      this.ensureSolfegeSynthChannels();
+    }
+
     const currentTime = this.sequencer.currentTime;
     const wasPlaying = !this.sequencer.paused;
     this.sequencer.loadNewSongList([{ binary: filteredMidi.writeMIDI(), fileName: this.currentMidiName }]);
     this.sequencer.currentTime = currentTime;
+    this.sequencer.playbackRate = this.playbackRate;
+    this.applyKeyShiftToChannels();
+    this.applyMuteSoloRules();
     if (wasPlaying) this.sequencer.play();
   }
 
-  // --- Interactive Virtual Piano direct playback ---
+  // --- Interactive Virtual Piano direct playback (supports polyphonic Solfege chords) ---
 
   public playNoteInteractive(channel: number, midiNote: number, velocity: number = 100): void {
     if (!this.synth) return;
     this.resumeAudioContext();
+
+    const chObj = this.channels[channel];
+    if (chObj?.isSolfaVocal && this.solfegeBankMeta && channel !== 9) {
+      this.ensureSolfegeSynthChannels();
+      const degree = ((midiNote % 12) - this.solfaRootKey + 12) % 12;
+      const subCh = degreeToSolfaSubChannel(degree);
+      const targetSynthCh = this.solfegeBaseSynthChannel + subCh;
+      const patch = this.solfegePresetMap[degree];
+      if (patch) {
+        this.synth.controllerChange(targetSynthCh, 0, patch.bankMSB);
+        this.synth.controllerChange(targetSynthCh, 32, patch.bankLSB);
+        this.synth.programChange(targetSynthCh, patch.program);
+      }
+      const panCC = Math.max(0, Math.min(127, Math.round((chObj.pan + 1) * 63.5)));
+      this.synth.controllerChange(targetSynthCh, 7, chObj.volume);
+      this.synth.controllerChange(targetSynthCh, 10, panCC);
+      this.synth.controllerChange(targetSynthCh, 91, chObj.reverb);
+      this.synth.midiChannels[targetSynthCh]?.setSystemParameter('keyShift', this.transposeSemitones);
+
+      this.interactiveSolfaNotes.set(`${channel}:${midiNote}`, targetSynthCh);
+      const stack = this.solfaActivePitchToUiChannel.get(midiNote) || [];
+      stack.unshift(channel);
+      this.solfaActivePitchToUiChannel.set(midiNote, stack);
+
+      this.synth.noteOn(targetSynthCh, midiNote, velocity);
+      chObj.activeNotes.add(midiNote);
+      this.notifyNoteEvent(channel, midiNote, velocity, true);
+      this.notifyChannelUpdate();
+      return;
+    }
+
     this.synth.noteOn(channel, midiNote, velocity);
     this.channels[channel].activeNotes.add(midiNote);
     this.notifyNoteEvent(channel, midiNote, velocity, true);
@@ -628,6 +1150,24 @@ class AudioEngine {
 
   public stopNoteInteractive(channel: number, midiNote: number): void {
     if (!this.synth) return;
+
+    const noteKey = `${channel}:${midiNote}`;
+    const solfaSynthCh = this.interactiveSolfaNotes.get(noteKey);
+    if (solfaSynthCh !== undefined) {
+      this.interactiveSolfaNotes.delete(noteKey);
+      const stack = this.solfaActivePitchToUiChannel.get(midiNote);
+      if (stack) {
+        const idx = stack.indexOf(channel);
+        if (idx >= 0) stack.splice(idx, 1);
+        if (stack.length === 0) this.solfaActivePitchToUiChannel.delete(midiNote);
+      }
+      this.synth.noteOff(solfaSynthCh, midiNote);
+      this.channels[channel].activeNotes.delete(midiNote);
+      this.notifyNoteEvent(channel, midiNote, 0, false);
+      this.notifyChannelUpdate();
+      return;
+    }
+
     this.synth.noteOff(channel, midiNote);
     this.channels[channel].activeNotes.delete(midiNote);
     this.notifyNoteEvent(channel, midiNote, 0, false);

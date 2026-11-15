@@ -5,7 +5,7 @@
 
 import React, { useState, useEffect } from 'react';
 import { audioEngine } from './services/audioEngine';
-import { ChannelState, TrackInfo, SoundFontMeta, SequencerNote } from './types/midi';
+import { ChannelState, TrackInfo, SoundFontMeta, SequencerNote, SolfegeBankMeta } from './types/midi';
 import { Header } from './components/Header';
 import { TransportBar } from './components/TransportBar';
 import { VirtualPiano } from './components/VirtualPiano';
@@ -30,6 +30,7 @@ export default function App() {
   // SoundFont state
   const [isSoundFontLoaded, setIsSoundFontLoaded] = useState(false);
   const [soundFonts, setSoundFonts] = useState<SoundFontMeta[]>([]);
+  const [solfegeBankMeta, setSolfegeBankMeta] = useState<SolfegeBankMeta | null>(null);
 
   // Transport state
   const [currentTime, setCurrentTime] = useState(0);
@@ -75,6 +76,7 @@ export default function App() {
       setParsedNotes([...audioEngine.getParsedNotes()]);
       setIsSoundFontLoaded(audioEngine.getIsSoundFontLoaded());
       setSoundFonts([...audioEngine.getSoundFonts()]);
+      setSolfegeBankMeta(audioEngine.getSolfegeBankMeta());
     });
 
     const unsubBenchmark = audioEngine.onBenchmark((m) => {
@@ -409,6 +411,8 @@ export default function App() {
             channels={channels}
             selectedChannel={selectedChannel}
             onSelectChannel={setSelectedChannel}
+            solfegeBankMeta={solfegeBankMeta}
+            onOpenSoundFontModal={() => setIsSoundFontModalOpen(true)}
           />
         )}
 
@@ -422,6 +426,7 @@ export default function App() {
         isOpen={isSoundFontModalOpen}
         onClose={() => setIsSoundFontModalOpen(false)}
         soundFonts={soundFonts}
+        solfegeBankMeta={solfegeBankMeta}
         isSoundFontLoaded={isSoundFontLoaded}
       />
 

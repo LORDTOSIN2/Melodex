@@ -52,6 +52,11 @@ class SoundFontStorage {
    * Retrieves a SoundFont ArrayBuffer from persistent IndexedDB
    */
   public async getSoundFont(id: string): Promise<ArrayBuffer | null> {
+    const res = await this.getSoundFontWithMeta(id);
+    return res ? res.buffer : null;
+  }
+
+  public async getSoundFontWithMeta(id: string): Promise<{ name: string; buffer: ArrayBuffer } | null> {
     try {
       const db = await this.openDB();
       return new Promise((resolve, reject) => {
@@ -61,7 +66,7 @@ class SoundFontStorage {
 
         request.onsuccess = () => {
           const item = request.result as StoredSoundFont | undefined;
-          resolve(item ? item.buffer : null);
+          resolve(item ? { name: item.name, buffer: item.buffer } : null);
         };
 
         request.onerror = () => {

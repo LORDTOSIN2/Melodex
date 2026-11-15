@@ -4,9 +4,9 @@
  */
 
 import React from 'react';
-import { Volume2, Lock, Unlock, Sliders, Music, Disc } from 'lucide-react';
+import { Lock, Unlock, Sliders, Mic } from 'lucide-react';
 import { audioEngine } from '../services/audioEngine';
-import { ChannelState } from '../types/midi';
+import { ChannelState, SolfegeBankMeta } from '../types/midi';
 import { GM_INSTRUMENTS, GM_DRUM_KITS } from '../services/gmInstruments';
 import { CHANNEL_COLORS } from './VirtualPiano';
 
@@ -14,12 +14,16 @@ interface MixerConsoleProps {
   channels: ChannelState[];
   selectedChannel: number;
   onSelectChannel: (ch: number) => void;
+  solfegeBankMeta: SolfegeBankMeta | null;
+  onOpenSoundFontModal: () => void;
 }
 
 export const MixerConsole: React.FC<MixerConsoleProps> = ({
   channels,
   selectedChannel,
-  onSelectChannel
+  onSelectChannel,
+  solfegeBankMeta,
+  onOpenSoundFontModal
 }) => {
   return (
     <div className="bg-slate-900/60 p-4 rounded-xl border border-slate-800">
@@ -33,7 +37,28 @@ export const MixerConsole: React.FC<MixerConsoleProps> = ({
             (CC7 Volume, CC10 Pan, CC91 Reverb &amp; Preset Lock)
           </span>
         </div>
-        <div className="text-xs text-slate-400 flex items-center gap-3">
+        <div className="text-xs text-slate-400 flex flex-wrap items-center gap-3">
+          {solfegeBankMeta ? (
+            <button
+              type="button"
+              onClick={onOpenSoundFontModal}
+              className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 hover:bg-cyan-500/25 transition-colors text-[11px] font-medium"
+              title="Layered Solfege Vocal SoundFont on Bank 100"
+            >
+              <Mic className="w-3 h-3" />
+              <span>Solfa Bank: {solfegeBankMeta.name}</span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={onOpenSoundFontModal}
+              className="flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-colors text-[11px]"
+              title="Load a 12-preset Solfege .sf2 layered on Bank 100"
+            >
+              <Mic className="w-3 h-3 text-cyan-400" />
+              <span>+ Load Solfa SF2</span>
+            </button>
+          )}
           <span className="flex items-center gap-1">
             <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 inline-block" /> Active Voice Signal
           </span>
@@ -103,8 +128,8 @@ export const MixerConsole: React.FC<MixerConsoleProps> = ({
                 </select>
               </div>
 
-              {/* Preset Lock Toggle */}
-              <div className="flex items-center justify-between mb-2">
+              {/* Preset Lock & Solfa Vocal Toggles */}
+              <div className="flex items-center justify-between gap-1 mb-2">
                 <button
                   type="button"
                   onClick={(e) => {
@@ -121,15 +146,42 @@ export const MixerConsole: React.FC<MixerConsoleProps> = ({
                   {ch.presetLocked ? (
                     <>
                       <Lock className="w-2.5 h-2.5" />
-                      <span>Locked</span>
+                      <span>Lock</span>
                     </>
                   ) : (
                     <>
                       <Unlock className="w-2.5 h-2.5" />
-                      <span>Unlocked</span>
+                      <span>Free</span>
                     </>
                   )}
                 </button>
+
+                {ch.channelNumber !== 9 && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (!solfegeBankMeta) {
+                        onOpenSoundFontModal();
+                      } else {
+                        audioEngine.toggleChannelSolfaVocal(ch.channelNumber);
+                      }
+                    }}
+                    className={`flex items-center gap-0.5 text-[10px] px-1.5 py-0.5 rounded border transition-colors ${
+                      ch.isSolfaVocal
+                        ? 'bg-cyan-500/25 text-cyan-200 border-cyan-400/60 shadow-sm shadow-cyan-500/20'
+                        : 'bg-slate-900 text-slate-500 border-slate-800 hover:text-cyan-300'
+                    }`}
+                    title={
+                      solfegeBankMeta
+                        ? 'Toggle polyphonic Movable-Do Solfa singing on this channel'
+                        : 'Load a 12-preset Solfege .sf2 to sing Movable-Do syllables on this channel'
+                    }
+                  >
+                    <Mic className="w-2.5 h-2.5" />
+                    <span>Solfa</span>
+                  </button>
+                )}
               </div>
 
               {/* Pan & Reverb Knobs / Sliders */}
