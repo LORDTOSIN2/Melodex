@@ -88,6 +88,20 @@ export const SoundFontModal: React.FC<SoundFontModalProps> = ({
     e.target.value = '';
   };
 
+  const handleLoadBundledSolfege = async () => {
+    try {
+      setLoadingStatus({ progress: 15, message: 'Loading bundled QDSolfege (1.2MB)...' });
+      await audioEngine.loadBundledSolfegeSoundFont((progress, message) => {
+        setLoadingStatus({ progress, message });
+      });
+      setTimeout(() => setLoadingStatus(null), 1600);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setLoadingStatus({ progress: 100, message: `Bundled Solfege Error: ${msg}` });
+      setTimeout(() => setLoadingStatus(null), 3500);
+    }
+  };
+
   const handleRemoveSolfege = async () => {
     await audioEngine.removeSolfegeSoundFont();
     setLoadingStatus({ progress: 100, message: 'Removed layered Solfege vocal bank.' });
@@ -240,17 +254,26 @@ export const SoundFontModal: React.FC<SoundFontModalProps> = ({
                   Layered Solfege Vocal Bank (Bank 100 • Polyphonic)
                 </h3>
                 <p className="text-[10px] text-cyan-300/75">
-                  Uses 12 syllable presets (Programs 0–11: Do–Ti). GeneralUser GS stays active on Bank 0 for drums &amp; accompaniment.
+                  Bundled QDSolfege V3.1 (Movable-Do). GeneralUser GS stays active on Bank 0 for drums &amp; accompaniment.
                 </p>
               </div>
             </div>
-            <div className="flex items-center gap-1.5">
+            <div className="flex flex-wrap items-center gap-1.5">
+              {(!solfegeBankMeta || !solfegeBankMeta.name.includes('Bundled')) && (
+                <button
+                  type="button"
+                  onClick={handleLoadBundledSolfege}
+                  className="px-2.5 py-1.5 rounded-md bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-semibold transition-colors cursor-pointer"
+                >
+                  Use Bundled QDSolfege
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => solfegeInputRef.current?.click()}
                 className="px-2.5 py-1.5 rounded-md bg-cyan-600 hover:bg-cyan-500 text-white text-[11px] font-semibold transition-colors cursor-pointer"
               >
-                {solfegeBankMeta ? 'Replace Solfege .sf2' : 'Load Solfege .sf2'}
+                {solfegeBankMeta ? 'Upload Custom .sf2' : 'Load Custom .sf2'}
               </button>
               {solfegeBankMeta && (
                 <button
@@ -305,7 +328,7 @@ export const SoundFontModal: React.FC<SoundFontModalProps> = ({
             </div>
           ) : (
             <p className="text-[11px] text-slate-400">
-              No Solfege SoundFont loaded yet. Upload a `.sf2` with Programs 0–11 mapped to Do, Di, Re, Ri, Mi, Fa, Fi, Sol, Si, La, Ta, Ti, then toggle <strong className="text-cyan-300">Solfa Sing</strong> on any channel in the Mixer.
+              No Solfege SoundFont currently active. Click <strong className="text-emerald-300">Use Bundled QDSolfege</strong> or upload a custom `.sf2`/`.sf3`, then toggle <strong className="text-cyan-300">Solfa</strong> on any channel in the Mixer.
             </p>
           )}
         </div>

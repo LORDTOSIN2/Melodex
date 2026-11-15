@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<museScore>
+<!-- Cut here -->
+     <InstrumentGroup id="Solfege">
+	     <name>Solfege</name>
+            <Instrument id="QDSolfege">
+                  <longName>Solfege</longName>
+                  <shortName>Solf.</shortName>
+                  <description>Solfege</description>
+                  <musicXMLid>vocal</musicXMLid>
+                  <StringData>
+                  </StringData>
+                  <clef>G</clef>
+                  <barlineSpan>1</barlineSpan>
+                  <aPitchRange>41-84</aPitchRange>
+                  <pPitchRange>41-84</pPitchRange>
+                  <Channel name="dies/sharp">
+				        <controller ctrl="32" value="50"/>  
+                        <program value="53"/> <!-- Dies -->
+                  </Channel>
+                  <Channel name="bemol/flat">
+				        <controller ctrl="32" value="51"/>  
+                        <program value="53"/> <!-- Bemol -->
+                  </Channel>
+                  <Channel name="2dies/2sharp + e#, b#">
+				        <controller ctrl="32" value="52"/>  
+                        <program value="53"/> <!--Double Dies -->
+                  </Channel>
+				  <Channel name="2bemol/2flat + cb, fb">
+				        <controller ctrl="32" value="53"/>  
+                        <program value="53"/> <!-- Double Bemol -->
+                  </Channel>
+                  <genre>classroom</genre>
+            </Instrument>
+      </InstrumentGroup>
+<!-- Cut here -->
+</museScore>

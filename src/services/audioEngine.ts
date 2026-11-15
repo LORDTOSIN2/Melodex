@@ -29,6 +29,9 @@ import { getMajorDoRootFromKeyName, SOLFA_DEGREE_NAMES } from './solfaService';
 const SOLFEGE_BANK_ID = 'solfege_vocal';
 const SOLFEGE_STORAGE_KEY = 'solfege_vocal_sf2';
 const SOLFEGE_BANK_OFFSET = 100;
+const BUNDLED_SOLFEGE_URL = '/soundfonts/QDSolfege-movable.sf3';
+const BUNDLED_SOLFEGE_NAME = 'QDSolfege V3.1 (Bundled Movable-Do, 1.2MB)';
+const SOLFEGE_REMOVED_PREF_KEY = 'melodex_solfege_removed';
 
 interface SolfegePatchTarget {
   bankMSB: number;
@@ -437,6 +440,12 @@ class AudioEngine {
   public async clearSoundFontCache(): Promise<void> {
     await soundFontStorage.deleteSoundFont('generaluser_compact_sf3');
     await soundFontStorage.deleteSoundFont('generaluser_full_sf2');
+    await soundFontStorage.deleteSoundFont(SOLFEGE_STORAGE_KEY);
+    try {
+      localStorage.removeItem(SOLFEGE_REMOVED_PREF_KEY);
+    } catch {
+      // Ignore storage errors
+    }
   }
 
   // --- Layered Solfege Vocal SoundFont (Bank Offset 100, 12 Presets 0..11) ---
@@ -472,12 +481,43 @@ class AudioEngine {
       }
     }
 
+    // Also build smart syllable-name matches in case presets are at arbitrary program numbers
+    const nameMatchByDegree = new Map<number, SolfegePatchTarget>();
+    const degreePatterns: [number, RegExp][] = [
+      [0, /\b(doh?|ut)\b/i],
+      [1, /\b(di|ra)\b/i],
+      [2, /\b(re|ray)\b/i],
+      [3, /\b(ri|me|ma)\b/i],
+      [4, /\bmi\b/i],
+      [5, /\bfa\b/i],
+      [6, /\b(fi|se)\b/i],
+      [7, /\b(sol?|so)\b/i],
+      [8, /\b(le|lo|sil)\b/i],
+      [9, /\bla\b/i],
+      [10, /\b(ta|li|te)\b/i],
+      [11, /\b(ti|si)\b/i]
+    ];
+    for (const p of bank.presets) {
+      if (p.isGMGSDrum) continue;
+      const cleanName = p.name || '';
+      for (const [deg, rx] of degreePatterns) {
+        if (!nameMatchByDegree.has(deg) && rx.test(cleanName)) {
+          nameMatchByDegree.set(deg, {
+            bankMSB: Math.min(127, p.bankMSB + SOLFEGE_BANK_OFFSET),
+            bankLSB: p.bankLSB || 0,
+            program: p.program,
+            name: cleanName || SOLFA_DEGREE_NAMES[deg]
+          });
+        }
+      }
+    }
+
     const detectedDegrees: number[] = [];
     const presetNames: Record<number, string> = {};
     const presetMap: Record<number, SolfegePatchTarget> = {};
 
     for (let deg = 0; deg < 12; deg++) {
-      const exact = availableByProg.get(deg);
+      const exact = availableByProg.get(deg) ?? nameMatchByDegree.get(deg);
       if (exact) {
         detectedDegrees.push(deg);
         presetNames[deg] = exact.name;
@@ -555,10 +595,51 @@ class AudioEngine {
       const cached = await soundFontStorage.getSoundFontWithMeta(SOLFEGE_STORAGE_KEY);
       if (cached) {
         await this.registerSolfegeBuffer(cached.buffer, cached.name, false);
+        return;
+      }
+
+      const wasExplicitlyRemoved =
+        typeof localStorage !== 'undefined' &&
+        localStorage.getItem(SOLFEGE_REMOVED_PREF_KEY) === '1';
+      if (!wasExplicitlyRemoved) {
+        await this.loadBundledSolfegeSoundFont();
       }
     } catch (err) {
-      console.warn('Could not restore cached Solfege SoundFont:', err);
+      console.warn('Could not restore or load bundled Solfege SoundFont:', err);
     }
+  }
+
+  public async loadBundledSolfegeSoundFont(
+    onProgress?: (pct: number, msg: string) => void
+  ): Promise<SolfegeBankMeta> {
+    await this.initialize();
+    await this.resumeAudioContext();
+
+    try {
+      localStorage.removeItem(SOLFEGE_REMOVED_PREF_KEY);
+    } catch {
+      // Ignore storage errors
+    }
+
+    onProgress?.(20, 'Downloading bundled QDSolfege (1.2MB)...');
+    const response = await fetch(BUNDLED_SOLFEGE_URL);
+    if (!response.ok) {
+      throw new Error(`Failed to load bundled QDSolfege: ${response.statusText}`);
+    }
+    const buffer = await response.arrayBuffer();
+
+    onProgress?.(65, `Layering ${BUNDLED_SOLFEGE_NAME} at Bank ${SOLFEGE_BANK_OFFSET}...`);
+    const meta = await this.registerSolfegeBuffer(buffer, BUNDLED_SOLFEGE_NAME, true);
+
+    onProgress?.(
+      100,
+      `Bundled QDSolfege ready (${meta.detectedDegrees.length}/12 vocal presets mapped)!`
+    );
+
+    if (this.channels.some((c) => c.isSolfaVocal)) {
+      this.applyTrackFilter();
+    }
+    return meta;
   }
 
   public async loadSolfegeSoundFont(
@@ -567,6 +648,12 @@ class AudioEngine {
   ): Promise<SolfegeBankMeta> {
     await this.initialize();
     await this.resumeAudioContext();
+
+    try {
+      localStorage.removeItem(SOLFEGE_REMOVED_PREF_KEY);
+    } catch {
+      // Ignore storage errors
+    }
 
     onProgress?.(20, `Reading ${file.name}...`);
     const buffer = await file.arrayBuffer();
@@ -586,6 +673,11 @@ class AudioEngine {
   }
 
   public async removeSolfegeSoundFont(): Promise<void> {
+    try {
+      localStorage.setItem(SOLFEGE_REMOVED_PREF_KEY, '1');
+    } catch {
+      // Ignore storage errors
+    }
     await soundFontStorage.deleteSoundFont(SOLFEGE_STORAGE_KEY);
     try {
       this.synth?.soundBankManager.deleteSoundBank(SOLFEGE_BANK_ID);
