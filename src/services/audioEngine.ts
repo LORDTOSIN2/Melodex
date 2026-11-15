@@ -5,8 +5,10 @@
 
 import { WorkletSynthesizer, Sequencer } from 'spessasynth_lib';
 import { BasicMIDI } from 'spessasynth_core';
-import { ChannelState, TrackInfo, SoundFontMeta, BenchmarkMetrics, SequencerNote } from '../types/midi';
+import { ChannelState, TrackInfo, SoundFontMeta, BenchmarkMetrics, SequencerNote, MidiSongSummary } from '../types/midi';
 import { GM_INSTRUMENTS } from './gmInstruments';
+import { soundFontStorage } from './soundFontStorage';
+import { downloadMidiBuffer, summarizeMidiForAi } from './midiCompiler';
 
 export type NoteEventCallback = (channel: number, midiNote: number, velocity: number, isNoteOn: boolean) => void;
 export type TransportCallback = (currentTime: number, duration: number, isPlaying: boolean, tempoBpm: number) => void;
@@ -24,6 +26,7 @@ class AudioEngine {
   private currentMidi: BasicMIDI | null = null;
   private rawMidiBuffer: ArrayBuffer | null = null;
   private currentMidiName: string = '';
+  private previousMidiSnapshot: { buffer: ArrayBuffer; name: string } | null = null;
 
   // Channel & Track State
   private channels: ChannelState[] = [];
@@ -220,58 +223,103 @@ class AudioEngine {
     }
   }
 
-  public async loadDefaultSoundFont(onProgress?: (pct: number, msg: string) => void): Promise<void> {
+  public async loadSoundFont(
+    type: 'compact' | 'full' = 'compact',
+    onProgress?: (pct: number, msg: string) => void
+  ): Promise<void> {
     await this.initialize();
     await this.resumeAudioContext();
 
     if (!this.synth) throw new Error('Synth not initialized');
 
-    onProgress?.(10, 'Fetching GeneralUser GS SoundFont (30MB)...');
-    const response = await fetch('/soundfonts/GeneralUser.sf2');
-    if (!response.ok) {
-      throw new Error(`Failed to load SoundFont: ${response.statusText}`);
-    }
+    const isCompact = type === 'compact';
+    const soundFontUrl = isCompact
+      ? '/soundfonts/GeneralUser-compact.sf3'
+      : '/soundfonts/GeneralUser.sf2';
+    const soundFontId = isCompact ? 'generaluser_compact_sf3' : 'generaluser_full_sf2';
+    const soundFontName = isCompact
+      ? 'GeneralUser GS (Compact SF3, 6.1MB)'
+      : 'GeneralUser GS (Full SF2, 30MB)';
+    const fallbackSize = isCompact ? 6378548 : 31457280;
 
-    const reader = response.body?.getReader();
-    const contentLength = +(response.headers.get('Content-Length') || 31457280);
-    let receivedLength = 0;
-    const chunks: Uint8Array[] = [];
+    // 1. Check local persistent IndexedDB first!
+    onProgress?.(5, 'Checking local browser cache (IndexedDB)...');
+    const cachedBuffer = await soundFontStorage.getSoundFont(soundFontId);
 
-    if (reader) {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        receivedLength += value.length;
-        const pct = Math.min(85, Math.round(10 + (receivedLength / contentLength) * 75));
-        onProgress?.(pct, `Downloading SoundFont... ${(receivedLength / (1024 * 1024)).toFixed(1)}MB`);
+    let finalBuffer: ArrayBuffer;
+    let loadedFromCache = false;
+
+    if (cachedBuffer) {
+      onProgress?.(35, `Loading ${soundFontName} from persistent browser storage...`);
+      finalBuffer = cachedBuffer;
+      loadedFromCache = true;
+    } else {
+      // 2. Stream download from network
+      onProgress?.(10, `Downloading ${soundFontName}...`);
+      const response = await fetch(soundFontUrl);
+      if (!response.ok) {
+        throw new Error(`Failed to load SoundFont: ${response.statusText}`);
       }
+
+      const reader = response.body?.getReader();
+      const contentLength = +(response.headers.get('Content-Length') || fallbackSize);
+      let receivedLength = 0;
+      const chunks: Uint8Array[] = [];
+
+      if (reader) {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          receivedLength += value.length;
+          const pct = Math.min(85, Math.round(10 + (receivedLength / contentLength) * 75));
+          onProgress?.(
+            pct,
+            `Downloading... ${(receivedLength / (1024 * 1024)).toFixed(1)}MB / ${(contentLength / (1024 * 1024)).toFixed(1)}MB`
+          );
+        }
+      }
+
+      const allChunks = new Uint8Array(receivedLength);
+      let position = 0;
+      for (const chunk of chunks) {
+        allChunks.set(chunk, position);
+        position += chunk.length;
+      }
+      finalBuffer = allChunks.buffer;
+
+      // Save to persistent IndexedDB for all future visits
+      onProgress?.(88, 'Saving SoundFont to browser persistent storage (IndexedDB)...');
+      await soundFontStorage.saveSoundFont(soundFontId, soundFontName, finalBuffer);
     }
 
-    onProgress?.(88, 'Parsing SoundFont presets & wavetables...');
-    const allChunks = new Uint8Array(receivedLength);
-    let position = 0;
-    for (const chunk of chunks) {
-      allChunks.set(chunk, position);
-      position += chunk.length;
-    }
-
-    onProgress?.(94, 'Registering SoundFont with AudioWorklet...');
-    await this.synth.soundBankManager.addSoundBank(allChunks.buffer, 'generaluser_default');
+    onProgress?.(92, 'Registering SoundFont with AudioWorklet...');
+    await this.synth.soundBankManager.addSoundBank(finalBuffer.slice(0), soundFontId);
     await this.synth.isReady;
 
     this.isSoundFontLoaded = true;
     this.loadedSoundFonts = [
       {
-        id: 'generaluser_default',
-        name: 'GeneralUser GS v1.47 (S. Christian Collins)',
-        sizeBytes: receivedLength,
+        id: soundFontId,
+        name: soundFontName,
+        sizeBytes: finalBuffer.byteLength,
         isDefault: true,
-        presetCount: 128
+        presetCount: 128,
+        isCachedLocally: true,
+        format: isCompact ? 'sf3' : 'sf2'
       }
     ];
 
-    onProgress?.(100, 'SoundFont ready!');
+    onProgress?.(
+      100,
+      loadedFromCache
+        ? 'Loaded from persistent browser storage (0 MB downloaded)!'
+        : 'SoundFont ready & cached for future visits!'
+    );
+  }
+
+  public async loadDefaultSoundFont(onProgress?: (pct: number, msg: string) => void): Promise<void> {
+    return this.loadSoundFont('compact', onProgress);
   }
 
   public async loadCustomSoundFont(file: File, onProgress?: (pct: number, msg: string) => void): Promise<void> {
@@ -283,7 +331,11 @@ class AudioEngine {
     onProgress?.(20, `Reading ${file.name}...`);
     const buffer = await file.arrayBuffer();
 
-    onProgress?.(60, 'Transferring SoundFont to synthesizer engine...');
+    // Cache custom SoundFont in IndexedDB as well
+    onProgress?.(50, 'Saving to browser persistent storage...');
+    await soundFontStorage.saveSoundFont(`custom_${file.name}`, file.name, buffer);
+
+    onProgress?.(70, 'Transferring SoundFont to synthesizer engine...');
     await this.synth.soundBankManager.addSoundBank(buffer, file.name);
     await this.synth.isReady;
 
@@ -293,10 +345,17 @@ class AudioEngine {
       name: file.name,
       sizeBytes: file.size,
       isDefault: false,
-      presetCount: 128
+      presetCount: 128,
+      isCachedLocally: true,
+      format: 'custom'
     });
 
-    onProgress?.(100, `Loaded ${file.name}!`);
+    onProgress?.(100, `Loaded & cached ${file.name}!`);
+  }
+
+  public async clearSoundFontCache(): Promise<void> {
+    await soundFontStorage.deleteSoundFont('generaluser_compact_sf3');
+    await soundFontStorage.deleteSoundFont('generaluser_full_sf2');
   }
 
   public async loadMidi(buffer: ArrayBuffer, fileName: string): Promise<void> {
@@ -643,6 +702,42 @@ class AudioEngine {
 
   public getCurrentMidiName(): string {
     return this.currentMidiName;
+  }
+
+  public getCurrentMidiBuffer(): ArrayBuffer | null {
+    return this.rawMidiBuffer ? this.rawMidiBuffer.slice(0) : null;
+  }
+
+  public getCurrentMidiSummary(): MidiSongSummary | null {
+    if (!this.rawMidiBuffer) return null;
+    return summarizeMidiForAi(this.rawMidiBuffer, this.currentMidiName || 'untitled.mid');
+  }
+
+  public canUndoAiEdit(): boolean {
+    return this.previousMidiSnapshot !== null;
+  }
+
+  public async loadAiMidi(buffer: ArrayBuffer, fileName: string, savePreviousForUndo = true): Promise<void> {
+    if (savePreviousForUndo && this.rawMidiBuffer) {
+      this.previousMidiSnapshot = {
+        buffer: this.rawMidiBuffer.slice(0),
+        name: this.currentMidiName
+      };
+    }
+    await this.loadMidi(buffer, fileName);
+  }
+
+  public async undoLastAiEdit(): Promise<boolean> {
+    if (!this.previousMidiSnapshot) return false;
+    const snap = this.previousMidiSnapshot;
+    this.previousMidiSnapshot = null;
+    await this.loadMidi(snap.buffer, snap.name);
+    return true;
+  }
+
+  public exportCurrentMidi(): void {
+    if (!this.rawMidiBuffer) return;
+    downloadMidiBuffer(this.rawMidiBuffer, this.currentMidiName || 'melodex_export.mid');
   }
 
   public getPlaybackRate(): number {

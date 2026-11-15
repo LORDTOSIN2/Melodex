@@ -15,7 +15,8 @@ import { PianoRoll } from './components/PianoRoll';
 import { SoundFontModal } from './components/SoundFontModal';
 import { DemoModal } from './components/DemoModal';
 import { BenchmarkPanel } from './components/BenchmarkPanel';
-import { Music, Play, Sliders, Layers, Sparkles, Volume2, Activity, ArrowRight } from 'lucide-react';
+import { AiComposerModal } from './components/AiComposerModal';
+import { Music, Sliders, Layers, Volume2, ArrowRight } from 'lucide-react';
 import { DEMO_SONGS } from './services/gmInstruments';
 
 export default function App() {
@@ -57,6 +58,7 @@ export default function App() {
   const [isSoundFontModalOpen, setIsSoundFontModalOpen] = useState(false);
   const [isDemoModalOpen, setIsDemoModalOpen] = useState(false);
   const [isBenchmarkOpen, setIsBenchmarkOpen] = useState(false);
+  const [isAiComposerOpen, setIsAiComposerOpen] = useState(false);
 
   // Setup subscribers
   useEffect(() => {
@@ -105,14 +107,16 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [hasStarted, isPlaying]);
 
+  const [startupSoundFontChoice, setStartupSoundFontChoice] = useState<'compact' | 'full'>('compact');
+
   // Start initialization flow
-  const handleStartMelodex = async () => {
+  const handleStartMelodex = async (type: 'compact' | 'full' = startupSoundFontChoice) => {
     setHasStarted(true);
-    setInitProgress({ progress: 10, message: 'Initializing Web Audio & AudioWorklet Engine...' });
+    setInitProgress({ progress: 5, message: 'Initializing Web Audio & AudioWorklet Engine...' });
     try {
       await audioEngine.initialize();
-      setInitProgress({ progress: 30, message: 'Loading General MIDI SoundFont (30MB)...' });
-      await audioEngine.loadDefaultSoundFont((pct, msg) => {
+      setInitProgress({ progress: 20, message: 'Checking persistent browser storage (IndexedDB)...' });
+      await audioEngine.loadSoundFont(type, (pct, msg) => {
         setInitProgress({ progress: pct, message: msg });
       });
 
@@ -184,29 +188,70 @@ export default function App() {
             </p>
           </div>
 
-          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-left my-4">
-            <div className="p-3 rounded-xl bg-slate-900/80 border border-slate-800">
-              <Volume2 className="w-4 h-4 text-emerald-400 mb-1" />
-              <div className="font-semibold text-xs text-slate-200">SF2 &amp; SF3 Synthesis</div>
-              <div className="text-[11px] text-slate-400 mt-0.5">30MB GeneralUser GS SoundFont</div>
+          {/* SoundFont Selection Options */}
+          <div className="text-left space-y-2 bg-slate-900/60 p-3.5 rounded-xl border border-slate-800">
+            <div className="flex items-center justify-between text-xs">
+              <span className="font-semibold text-slate-200">Choose SoundFont Size Profile:</span>
+              <span className="text-[10px] text-emerald-400 flex items-center gap-1 font-mono">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block animate-pulse" />
+                IndexedDB Persistent Cache
+              </span>
             </div>
-            <div className="p-3 rounded-xl bg-slate-900/80 border border-slate-800">
-              <Sliders className="w-4 h-4 text-indigo-400 mb-1" />
-              <div className="font-semibold text-xs text-slate-200">Separated Controls</div>
-              <div className="text-[11px] text-slate-400 mt-0.5">Independent Track &amp; Channel mixing</div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => setStartupSoundFontChoice('compact')}
+                className={`p-2.5 rounded-lg border text-left transition-all ${
+                  startupSoundFontChoice === 'compact'
+                    ? 'bg-indigo-950/70 border-indigo-500 ring-1 ring-indigo-500'
+                    : 'bg-slate-950/70 border-slate-800 hover:border-slate-700'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold text-white">Compact GM (6.1MB)</span>
+                  <span className="text-[10px] px-1.5 py-0.2 rounded bg-indigo-500/20 text-indigo-300 font-mono">
+                    Recommended
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-400 mt-0.5">
+                  Vorbis SF3. 79% smaller, instant download, low memory.
+                </p>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setStartupSoundFontChoice('full')}
+                className={`p-2.5 rounded-lg border text-left transition-all ${
+                  startupSoundFontChoice === 'full'
+                    ? 'bg-indigo-950/70 border-indigo-500 ring-1 ring-indigo-500'
+                    : 'bg-slate-950/70 border-slate-800 hover:border-slate-700'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold text-white">Studio GS (30MB)</span>
+                  <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400 font-mono">
+                    PCM Wavetable
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-400 mt-0.5">
+                  Uncompressed 16-bit PCM multi-velocity samples.
+                </p>
+              </button>
             </div>
-            <div className="p-3 rounded-xl bg-slate-900/80 border border-slate-800 col-span-2 sm:col-span-1">
-              <Sparkles className="w-4 h-4 text-amber-400 mb-1" />
-              <div className="font-semibold text-xs text-slate-200">Virtual Piano &amp; Solfa</div>
-              <div className="text-[11px] text-slate-400 mt-0.5">Movable-Do notation &amp; typing</div>
-            </div>
+
+            <p className="text-[10px] text-slate-400 pt-1">
+              💾 <strong>Persistent Storage:</strong> Once loaded, the SoundFont is saved locally in your browser (IndexedDB). Future visits load in ~50ms with 0 network bytes.
+            </p>
           </div>
 
           <button
-            onClick={handleStartMelodex}
+            onClick={() => handleStartMelodex(startupSoundFontChoice)}
             className="w-full py-3.5 px-6 rounded-xl bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white font-bold text-sm transition-all shadow-lg shadow-indigo-600/30 flex items-center justify-center gap-2 group cursor-pointer"
           >
-            <span>Initialize Audio &amp; Start Melodex</span>
+            <span>
+              Start Melodex ({startupSoundFontChoice === 'compact' ? 'Compact 6.1MB' : 'Studio 30MB'})
+            </span>
             <ArrowRight className="w-4 h-4 group-hover:translate-x-1 transition-transform" />
           </button>
 
@@ -265,6 +310,8 @@ export default function App() {
         onOpenSoundFontModal={() => setIsSoundFontModalOpen(true)}
         onOpenDemoModal={() => setIsDemoModalOpen(true)}
         onOpenBenchmark={() => setIsBenchmarkOpen(true)}
+        onOpenAiComposer={() => setIsAiComposerOpen(true)}
+        onSongLoaded={(title) => setCurrentSongTitle(title)}
         currentSongTitle={currentSongTitle}
       />
 
@@ -387,6 +434,13 @@ export default function App() {
       <BenchmarkPanel
         isOpen={isBenchmarkOpen}
         onClose={() => setIsBenchmarkOpen(false)}
+      />
+
+      <AiComposerModal
+        isOpen={isAiComposerOpen}
+        onClose={() => setIsAiComposerOpen(false)}
+        currentSongTitle={currentSongTitle}
+        onMidiUpdated={(newTitle) => setCurrentSongTitle(newTitle)}
       />
     </div>
   );

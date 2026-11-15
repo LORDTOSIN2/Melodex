@@ -4,7 +4,7 @@
  */
 
 import React from 'react';
-import { Music, Activity, Cpu, Upload, FolderOpen, Volume2, Sparkles } from 'lucide-react';
+import { Music, Activity, FolderOpen, Volume2, Sparkles, Wand2 } from 'lucide-react';
 import { audioEngine } from '../services/audioEngine';
 import { SoundFontMeta } from '../types/midi';
 
@@ -16,6 +16,8 @@ interface HeaderProps {
   onOpenSoundFontModal: () => void;
   onOpenDemoModal: () => void;
   onOpenBenchmark: () => void;
+  onOpenAiComposer: () => void;
+  onSongLoaded?: (title: string) => void;
   currentSongTitle: string;
 }
 
@@ -27,6 +29,8 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenSoundFontModal,
   onOpenDemoModal,
   onOpenBenchmark,
+  onOpenAiComposer,
+  onSongLoaded,
   currentSongTitle
 }) => {
   const fileInputRef = React.useRef<HTMLInputElement>(null);
@@ -36,9 +40,10 @@ export const Header: React.FC<HeaderProps> = ({
     if (!file) return;
 
     const reader = new FileReader();
-    reader.onload = () => {
+    reader.onload = async () => {
       if (reader.result instanceof ArrayBuffer) {
-        audioEngine.loadMidi(reader.result, file.name);
+        await audioEngine.loadMidi(reader.result, file.name);
+        onSongLoaded?.(file.name.replace(/\.(mid|midi|kar)$/i, ''));
       }
     };
     reader.readAsArrayBuffer(file);
@@ -99,8 +104,17 @@ export const Header: React.FC<HeaderProps> = ({
         </button>
       </div>
 
-      {/* Action Buttons: Demos & Upload */}
+      {/* Action Buttons: AI Composer, Demos & Upload */}
       <div className="flex items-center gap-2">
+        <button
+          onClick={onOpenAiComposer}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 text-white transition-all shadow-sm shadow-violet-600/30 cursor-pointer"
+          title="Create a new MIDI or add AI tracks to the current arrangement"
+        >
+          <Wand2 className="w-3.5 h-3.5" />
+          <span>AI Composer</span>
+        </button>
+
         <button
           onClick={onOpenDemoModal}
           className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100 transition-colors shadow-sm"

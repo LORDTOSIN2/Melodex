@@ -35,6 +35,8 @@ export interface SoundFontMeta {
   sizeBytes: number;
   isDefault: boolean;
   presetCount: number;
+  isCachedLocally?: boolean;
+  format?: 'sf2' | 'sf3' | 'custom';
 }
 
 export interface BenchmarkMetrics {
@@ -73,4 +75,68 @@ export interface SequencerNote {
   duration: number; // in seconds
   velocity: number;
 }
+
+export interface SymbolicNote {
+  pitch: number; // 0-127
+  startBeat: number; // >= 0
+  durationBeats: number; // > 0
+  velocity: number; // 1-127
+}
+
+export interface SymbolicTrack {
+  name: string;
+  channel: number; // 0-15 (9 = drums)
+  program: number; // 0-127 GM program
+  isDrum: boolean;
+  volume: number; // 0-127
+  pan: number; // 0-127 (64 = center)
+  notes: SymbolicNote[];
+}
+
+export interface SymbolicArrangement {
+  title: string;
+  bpm: number;
+  timeSignatureNumerator: number;
+  timeSignatureDenominator: number;
+  musicalKey: string;
+  totalBars: number;
+  tracks: SymbolicTrack[];
+}
+
+export interface MidiSongSummary {
+  fileName: string;
+  bpm: number;
+  timeSignatureNumerator: number;
+  timeSignatureDenominator: number;
+  totalBars: number;
+  totalBeats: number;
+  durationSeconds: number;
+  usedChannels: number[];
+  existingTracks: {
+    index: number;
+    name: string;
+    channels: number[];
+    program: number;
+    noteCount: number;
+  }[];
+  barDigest: string[];
+}
+
+export type AiComposeMode = 'create' | 'add_track';
+
+export interface AiComposeRequest {
+  mode: AiComposeMode;
+  prompt: string;
+  bpm?: number;
+  musicalKey?: string;
+  totalBars?: number;
+  timeSignature?: string;
+  songSummary?: MidiSongSummary;
+}
+
+export interface AiComposeResponse {
+  arrangement: SymbolicArrangement;
+  modelUsed: string;
+}
+
 
